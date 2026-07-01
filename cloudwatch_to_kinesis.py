@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 """
 cloudwatch_to_kinesis.py — Infrastructure Initialization Script
 Creates CloudWatch Log Group, Kinesis Stream, and the Subscription Filter
