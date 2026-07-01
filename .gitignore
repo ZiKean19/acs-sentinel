@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+venv/
+env/
+*.pyc
+*.pyo
+uploads/
+model/
+
+# Frontend
+node_modules/
+dist/
+
+# Sensitive — never commit these
+.env
+key.json
+localstack_data/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

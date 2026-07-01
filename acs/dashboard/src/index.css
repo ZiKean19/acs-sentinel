@@ -1,0 +1,196 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Share+Tech+Mono&family=Rajdhani:wght@500;600;700&display=swap');
+
+/* ── DARK THEME (Premium Glassmorphism) ───────────────────────────────────────────────── */
+:root,
+[data-theme="dark"] {
+  --bg-base:      radial-gradient(ellipse at top, #0f1c2e 0%, #03060a 100%);
+  --bg-panel:     rgba(10, 14, 23, 0.65);
+  --bg-card:      rgba(15, 23, 33, 0.5);
+  --bg-hover:     rgba(30, 45, 61, 0.8);
+  --border:       rgba(42, 64, 96, 0.5);
+  --border-bright:rgba(0, 204, 255, 0.4);
+  --accent-green: #00ff88;
+  --accent-blue:  #00ccff;
+  --accent-red:   #ff2a55;
+  --accent-amber: #ffb800;
+  --text-primary: #f0f6fc;
+  --text-muted:   #8b949e;
+  --text-dim:     #484f58;
+  --font-mono:    'Share Tech Mono', monospace;
+  --font-ui:      'Inter', sans-serif;
+  --chart-tooltip-bg: rgba(10, 14, 23, 0.85);
+  --chart-tooltip-border: rgba(42, 64, 96, 0.6);
+  --chart-tick:   #8b949e;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: rgba(42, 64, 96, 0.6);
+  --scanline-color: rgba(0, 204, 255, 0.015);
+}
+
+/* ── LIGHT THEME (Frosted Glass) ───────────────────────────────────────────────────────── */
+[data-theme="light"] {
+  --bg-base:      radial-gradient(ellipse at top, #e8f0f8 0%, #cbd5e1 100%);
+  --bg-panel:     rgba(255, 255, 255, 0.7);
+  --bg-card:      rgba(255, 255, 255, 0.5);
+  --bg-hover:     rgba(255, 255, 255, 0.9);
+  --border:       rgba(148, 163, 184, 0.4);
+  --border-bright:rgba(3, 105, 161, 0.5);
+  --accent-green: #059669;
+  --accent-blue:  #0369a1;
+  --accent-red:   #dc2626;
+  --accent-amber: #d97706;
+  --text-primary: #0f172a;
+  --text-muted:   #475569;
+  --text-dim:     #94a3b8;
+  --font-mono:    'Share Tech Mono', monospace;
+  --font-ui:      'Inter', sans-serif;
+  --chart-tooltip-bg: rgba(255, 255, 255, 0.9);
+  --chart-tooltip-border: rgba(148, 163, 184, 0.5);
+  --chart-tick:   #64748b;
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: rgba(148, 163, 184, 0.6);
+  --scanline-color: rgba(0, 0, 0, 0.02);
+}
+
+/* ── GLASSMORPHISM & ANIMATION UTILITIES ────────────────────────────────── */
+.glass-panel {
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+.slide-in-right {
+  animation: slide-in-right 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94) both;
+}
+
+@keyframes slide-in-right {
+  0%   { transform: translateX(20px); opacity: 0; }
+  100% { transform: translateX(0); opacity: 1; }
+}
+
+.glow-text-critical {
+  text-shadow: 0 0 10px rgba(255, 42, 85, 0.6);
+}
+
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  min-height: 100vh;
+  overflow-x: hidden;
+  transition: background 0.25s ease, color 0.25s ease;
+}
+
+/* Scanline overlay effect */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    var(--scanline-color) 2px,
+    var(--scanline-color) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--scrollbar-track); }
+::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 2px; }
+
+/* Theme toggle button */
+.theme-toggle {
+  width: 36px;
+  height: 20px;
+  border-radius: 10px;
+  background: var(--border-bright);
+  border: 1px solid var(--border-bright);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.2s ease;
+  flex-shrink: 0;
+}
+.theme-toggle::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--bg-base);
+  transition: transform 0.2s ease, background 0.2s ease;
+}
+[data-theme="light"] .theme-toggle {
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+}
+[data-theme="light"] .theme-toggle::after {
+  transform: translateX(16px);
+}
+
+/* Animations */
+@keyframes pulse-green {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+@keyframes scanin {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+@keyframes threat-flash {
+  0% { background: rgba(255,51,85,0.2); }
+  100% { background: transparent; }
+}
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+/* ── MOBILE RESPONSIVENESS ─────────────────────────────────────────────── */
+@media (max-width: 1200px) {
+  /* Stack the main grid columns */
+  .overview-grid {
+    display: flex !important;
+    flex-direction: column !important;
+  }
+}
+
+@media (max-width: 768px) {
+  /* App Header adjustments */
+  header, .top-bar {
+    height: auto !important;
+    flex-wrap: wrap;
+    padding: 8px !important;
+    gap: 10px !important;
+  }
+  
+  /* Hide minor stats in mobile to save space */
+  .live-dot, .v-number { display: none !important; }
+
+  /* Enlarge touch targets */
+  button {
+    min-height: 36px;
+    padding: 8px 16px !important;
+  }
+
+  /* Adjust panel heights */
+  .panel-body {
+    height: 400px !important;
+  }
+
+  /* Scale down charts for narrow screens */
+  .recharts-responsive-container {
+    height: 250px !important;
+  }
+}

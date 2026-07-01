@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>e-Print.my — Online Printing Service</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: #f0f4f8; color: #1a202c; }
+
+    header {
+      background: #1a365d; color: white;
+      padding: 16px 32px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    header h1 { font-size: 1.4rem; }
+    header span { font-size: 0.85rem; opacity: 0.7; }
+
+    .container { max-width: 860px; margin: 40px auto; padding: 0 20px; }
+
+    .card {
+      background: white; border-radius: 12px;
+      padding: 28px 32px; margin-bottom: 24px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+    .card h2 { font-size: 1.1rem; margin-bottom: 18px; color: #2d3748; }
+
+    label { display: block; font-size: 0.85rem; color: #4a5568; margin-bottom: 4px; margin-top: 14px; }
+    input, select {
+      width: 100%; padding: 9px 12px; border: 1px solid #cbd5e0;
+      border-radius: 6px; font-size: 0.95rem;
+    }
+    input:focus, select:focus { outline: none; border-color: #3182ce; }
+
+    .btn {
+      margin-top: 18px; padding: 10px 24px;
+      background: #2b6cb0; color: white;
+      border: none; border-radius: 6px;
+      font-size: 0.95rem; cursor: pointer; width: 100%;
+    }
+    .btn:hover { background: #2c5282; }
+    .btn-danger { background: #c53030; }
+    .btn-danger:hover { background: #9b2c2c; }
+
+    #response-box {
+      margin-top: 14px; padding: 12px 16px;
+      border-radius: 6px; font-size: 0.9rem; display: none;
+    }
+    .success { background: #c6f6d5; color: #276749; }
+    .error   { background: #fed7d7; color: #c53030; }
+
+    .price-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; margin-top: 10px; }
+    .price-table th { background: #ebf4ff; padding: 8px 12px; text-align: left; }
+    .price-table td { padding: 7px 12px; border-bottom: 1px solid #e2e8f0; }
+
+    footer { text-align: center; padding: 24px; font-size: 0.8rem; color: #a0aec0; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🖨️ e-Print.my</h1>
+  <span>Automated Cloud Security Sentinel — Demo Platform</span>
+</header>
+
+<div class="container">
+
+  <!-- Login -->
+  <div class="card">
+    <h2>🔐 Login</h2>
+    <label>Username</label>
+    <input type="text" id="username" placeholder="Enter username" />
+    <label>Password</label>
+    <input type="password" id="password" placeholder="Enter password" />
+    <button class="btn" onclick="doLogin()">Login</button>
+    <div id="login-response" class="response-box"></div>
+  </div>
+
+  <!-- File Upload / Print Order -->
+  <div class="card">
+    <h2>📄 Submit Print Order</h2>
+    <label>Select File (PDF, JPG, PNG, DOCX)</label>
+    <input type="file" id="file-input" accept=".pdf,.jpg,.jpeg,.png,.docx" />
+
+    <label>Paper Type</label>
+    <select id="paper-type">
+      {% for pt in paper_types %}
+      <option value="{{ pt }}">{{ pt.replace('_', ' ').title() }}</option>
+      {% endfor %}
+    </select>
+
+    <label>Number of Copies</label>
+    <input type="number" id="copies" value="1" min="1" max="500" />
+
+    <button class="btn" onclick="doUpload()">Submit Order</button>
+    <div id="upload-response" class="response-box"></div>
+  </div>
+
+  <!-- Payment -->
+  <div class="card" id="payment-card" style="display:none">
+    <h2>💳 Payment</h2>
+    <p id="payment-summary" style="margin-bottom:14px; font-size:0.95rem;"></p>
+    <label>Payment Method</label>
+    <select id="pay-method">
+      <option value="fpx">FPX Online Banking</option>
+      <option value="card">Credit / Debit Card</option>
+      <option value="ewallet">e-Wallet (Touch 'n Go)</option>
+    </select>
+    <button class="btn" onclick="doPay()">Pay Now</button>
+    <div id="pay-response" class="response-box"></div>
+  </div>
+
+  <!-- Pricing Reference -->
+  <div class="card">
+    <h2>💰 Pricing (per page per copy)</h2>
+    <table class="price-table">
+      <tr><th>Paper Type</th><th>Price (MYR)</th></tr>
+      <tr><td>Simili B&W</td><td>RM 0.05</td></tr>
+      <tr><td>Simili Colour</td><td>RM 0.20</td></tr>
+      <tr><td>Art Paper B&W</td><td>RM 0.15</td></tr>
+      <tr><td>Art Paper Colour</td><td>RM 0.50</td></tr>
+      <tr><td>Glossy Colour</td><td>RM 0.70</td></tr>
+    </table>
+  </div>
+
+  <!-- Admin link (intentionally exposed — attack surface for demo) -->
+  <div class="card">
+    <h2>⚙️ Admin Panel</h2>
+    <p style="font-size:0.85rem; color:#718096; margin-bottom:12px;">
+      Access order management (restricted — repeated access triggers anomaly detection).
+    </p>
+    <button class="btn btn-danger" onclick="doAdminAccess()">View All Orders</button>
+    <div id="admin-response" class="response-box"></div>
+  </div>
+
+</div>
+
+<footer>e-Print.my Demo Platform · ACS Sentinel Security Research · APU FYP 2026</footer>
+
+<script>
+  let currentOrderId = null;
+  let currentAmount  = 0;
+
+  function showResponse(boxId, message, isSuccess) {
+    const box = document.getElementById(boxId);
+    box.textContent   = message;
+    box.className     = "response-box " + (isSuccess ? "success" : "error");
+    box.style.display = "block";
+  }
+
+  async function doLogin() {
+    const username = document.getElementById("username").value;
+    const password = document.getElementById("password").value;
+    try {
+      const res  = await fetch("/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await res.json();
+      showResponse("login-response", data.message, res.ok);
+    } catch (e) {
+      showResponse("login-response", "Request failed: " + e.message, false);
+    }
+  }
+
+  async function doUpload() {
+    const fileInput = document.getElementById("file-input");
+    if (!fileInput.files.length) {
+      showResponse("upload-response", "Please select a file first.", false);
+      return;
+    }
+    const formData = new FormData();
+    formData.append("file",       fileInput.files[0]);
+    formData.append("paper_type", document.getElementById("paper-type").value);
+    formData.append("copies",     document.getElementById("copies").value);
+
+    try {
+      const res  = await fetch("/upload", { method: "POST", body: formData });
+      const data = await res.json();
+      if (res.ok) {
+        currentOrderId = data.order_id;
+        currentAmount  = data.total_price_myr;
+        showResponse("upload-response",
+          `Order submitted! ID: ${data.order_id} | Est. pages: ${data.estimated_pages} | Total: RM ${data.total_price_myr}`,
+          true);
+        document.getElementById("payment-card").style.display = "block";
+        document.getElementById("payment-summary").textContent =
+          `Order ${data.order_id} — RM ${data.total_price_myr}`;
+      } else {
+        showResponse("upload-response", data.error || "Upload failed.", false);
+      }
+    } catch (e) {
+      showResponse("upload-response", "Request failed: " + e.message, false);
+    }
+  }
+
+  async function doPay() {
+    try {
+      const res  = await fetch("/pay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          order_id: currentOrderId,
+          amount:   currentAmount,
+          method:   document.getElementById("pay-method").value,
+        }),
+      });
+      const data = await res.json();
+      showResponse("pay-response",
+        `Payment successful! Order ${data.order_id} confirmed.`, res.ok);
+    } catch (e) {
+      showResponse("pay-response", "Payment request failed: " + e.message, false);
+    }
+  }
+
+  async function doAdminAccess() {
+    try {
+      const res  = await fetch("/admin/orders");
+      const data = await res.json();
+      showResponse("admin-response",
+        `Retrieved ${Array.isArray(data) ? data.length : 0} order(s). Check stream_processor terminal for anomaly detection.`,
+        res.ok);
+    } catch (e) {
+      showResponse("admin-response", "Request failed: " + e.message, false);
+    }
+  }
+</script>
+</body>
+</html>
