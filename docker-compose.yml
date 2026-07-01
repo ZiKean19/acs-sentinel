@@ -1,0 +1,108 @@
+version: '3.8'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACS Sentinel — Docker Compose
+#
+# Two completely independent groups:
+#
+#   GROUP 1: ACS (the security product)
+#     - localstack    : emulates AWS (DynamoDB, Kinesis, CloudWatch)
+#     - acs-sentinel  : detection engine + dashboard API (standalone Flask)
+#     - acs-nginx     : reverse proxy for the TARGET app, reads blocklist
+#
+#   GROUP 2: Target App (the simulated business app — swap this for anything)
+#     - target-app    : simple print-on-demand Flask app
+#                       only responsibility: send logs to CloudWatch
+#
+# The target-app does NOT contain any ACS code.
+# To integrate ACS with a different app, only target-app is replaced.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── ACS: LocalStack (emulates AWS in development) ─────────────────────────
+  localstack:
+    image: localstack/localstack:latest
+    container_name: acs-localstack
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      - SERVICES=logs,kinesis,dynamodb,iam,cloudwatch,sqs
+      - DEBUG=0
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - PERSISTENCE=1
+    volumes:
+      - "${LOCALSTACK_VOLUME_DIR:-./localstack_data}:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "./init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh"
+    networks:
+      - acs-network
+
+  # ── ACS: Sentinel Engine + Dashboard API ──────────────────────────────────
+  acs-sentinel:
+    build:
+      context: ./acs/sentinel
+      dockerfile: Dockerfile
+    container_name: acs-sentinel
+    ports:
+      - "127.0.0.1:8080:8080"     # ACS dashboard served here
+    environment:
+      - LOCALSTACK_URL=http://localstack:4566
+      - ACCESS_LOG_PATH=/var/log/nginx/access.log
+      - NGINX_BLOCKLIST_PATH=/etc/nginx/blocked_ips.conf
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - nginx_logs:/var/log/nginx:ro
+      - ./acs/nginx/blocked_ips.conf:/etc/nginx/blocked_ips.conf
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - localstack
+    networks:
+      - acs-network
+
+  # ── ACS: Nginx (sits in front of the target app, enforces blocklist) ───────
+  acs-nginx:
+    build:
+      context: ./acs/nginx
+      dockerfile: Dockerfile
+    container_name: acs-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./acs/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./acs/nginx/blocked_ips.conf:/etc/nginx/blocked_ips.conf
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - target-app
+      - acs-sentinel
+    networks:
+      - acs-network
+
+  # ── TARGET APP (simulated business app — this is NOT part of ACS) ─────────
+  # Replace this container with your real application.
+  # The only ACS integration needed in the real app is:
+  #   1. Send HTTP access logs to CloudWatch Logs (one boto3 call).
+  #   2. That is all. ACS handles everything else.
+  target-app:
+    build:
+      context: ./target-app
+      dockerfile: Dockerfile
+    container_name: target-app
+    expose:
+      - "5000"
+    environment:
+      - LOCALSTACK_URL=http://localstack:4566
+    depends_on:
+      - localstack
+    networks:
+      - acs-network
+
+volumes:
+  nginx_logs:
+
+networks:
+  acs-network:
+    driver: bridge
