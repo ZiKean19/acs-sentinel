@@ -2,12 +2,11 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Shield, Activity, Ban, Bell, Terminal, Wifi, WifiOff, LogOut, Sun, Moon, RefreshCw, Info, Globe, Clock, AlertTriangle, History } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, AreaChart, Area, Legend } from 'recharts'
 import { fetchAlerts, fetchBlockedIPs, fetchLogs, unblockIP } from './api/client'
+import type { Alert, BlockedIP, LogEntry } from './api/client'
 import { usePolling } from './hooks/usePolling'
 import { signIn, signOut } from './api/auth'
 
-export type Alert     = { alert_id: string, timestamp: string, source_ip: string, severity: string, type: string, score: number, reason: string, method: string, geo_anomaly: number, metadata?: string }
-export type BlockedIP = { ip: string, blocked_at: string, reason: string, score: number, severity: string, ttl: number, geo_anomaly: number }
-export type LogEntry  = { log_id: string, timestamp: string, level: string, source: string, message: string, source_ip: string, geo_anomaly: number, score?: number }
+export type { Alert, BlockedIP, LogEntry }
 
 const MYT = 'Asia/Kuala_Lumpur'
 
