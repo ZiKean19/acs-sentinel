@@ -38,7 +38,7 @@ TTL_BY_SEVERITY = {
 }
 
 _AWS = dict(
-    region_name=AWS_REGION,
+    region_name="ap-southeast-1",
     aws_access_key_id="test",
     aws_secret_access_key="test",
     endpoint_url=LOCALSTACK_URL,

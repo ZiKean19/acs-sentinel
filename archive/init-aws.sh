@@ -4,8 +4,8 @@
 
 echo "=== Initializing LocalStack AWS Resources ==="
 
-REGION="us-east-1"
-ACCOUNT_ID="000000000000"
+REGION="ap-southeast-1"
+ACCOUNT_ID="567017109835"
 
 create_dynamo_table() {
   local table_name=$1

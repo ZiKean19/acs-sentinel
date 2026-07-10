@@ -18,7 +18,7 @@ SCALER_PATH = "model/scaler.pkl"
 
 # Isolation Forest decision-function threshold.
 # Scores below this value are treated as anomalies.
-IF_THRESHOLD = 0.031
+IF_THRESHOLD = -0.02
 
 ENABLE_RULES = True
 
@@ -130,7 +130,7 @@ class AnomalyDetectorEngine:
         self.model  = IsolationForest(
             n_estimators=300,
             max_samples="auto",
-            contamination=0.10,
+            contamination=0.03,
             random_state=42,
         )
         self.model.fit(X_scaled)

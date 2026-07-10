@@ -1,0 +1,196 @@
+"""
+anomaly_detector_engine.py — Lambda version
+
+Same hybrid rule + Isolation Forest logic as the local version, but the
+model/scaler are loaded from S3 into /tmp (Lambda's writable ephemeral
+storage) instead of a local ./model folder. If missing in S3, trains on
+synthetic data and uploads them so future cold starts can just download.
+"""
+
+import os
+import pickle
+import boto3
+import numpy as np
+from datetime import datetime
+
+MODEL_BUCKET = os.environ.get("MODEL_BUCKET", "acs-sentinel-models-teng")
+MODEL_KEY    = "isolation_forest.pkl"
+SCALER_KEY   = "scaler.pkl"
+MODEL_PATH   = "/tmp/isolation_forest.pkl"
+SCALER_PATH  = "/tmp/scaler.pkl"
+
+IF_THRESHOLD  = -0.02
+ENABLE_RULES  = True
+FEATURE_COLS  = ["total_requests", "failed_status_rate", "payload_size_variance"]
+
+RULES = [
+    ("failed_status_rate",    0.5,  "High rate of failed HTTP statuses",                     "HIGH"),
+    ("total_requests",        60,   "Elevated request rate",                                  "HIGH"),
+    ("total_requests",        300,  "Severe DDoS Flood",                                      "CRITICAL"),
+    ("payload_size_variance", 1e10, "High payload size variance (possible fuzzing/exfiltration)", "HIGH"),
+]
+
+s3 = boto3.client("s3")
+
+
+def rule_based_check(features: dict) -> dict | None:
+    triggered        = []
+    highest_severity = "NONE"
+    severity_rank    = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+    categories       = set()
+
+    for col, threshold, label, severity in RULES:
+        val = features.get(col, 0)
+        if val >= threshold:
+            triggered.append(f"{label} ({col}={val:.2f})")
+            if severity_rank[severity] > severity_rank[highest_severity]:
+                highest_severity = severity
+            if "status" in col:
+                categories.add("failure")
+            if "requests" in col:
+                categories.add("volume")
+            if "payload" in col:
+                categories.add("payload")
+
+    if len(categories) >= 2:
+        highest_severity = "CRITICAL"
+        triggered.append("Multi-Vector Traffic Anomaly Detected")
+
+    if triggered:
+        score_map   = {"LOW": -0.3, "MEDIUM": -0.6, "HIGH": -0.8, "CRITICAL": -1.0}
+        final_score = score_map.get(highest_severity, -0.5)
+        return {
+            "is_anomaly":  True,
+            "score":       final_score,
+            "threshold":   0.0,
+            "reason":      "; ".join(triggered),
+            "method":      "rule",
+            "severity":    highest_severity,
+            "geo_anomaly": int(features.get("geo_anomaly", 0)),
+            "timestamp":   datetime.utcnow().isoformat(),
+        }
+    return None
+
+
+def _generate_normal_samples(n: int = 2000) -> np.ndarray:
+    rng = np.random.default_rng(42)
+    return np.column_stack([
+        rng.integers(1, 15, n),
+        rng.uniform(0.0, 0.05, n),
+        rng.uniform(0, 100_000, n),
+    ]).astype(np.float64)
+
+
+def _generate_attack_samples(n: int = 200) -> np.ndarray:
+    rng     = np.random.default_rng(99)
+    samples = []
+    for _ in range(n):
+        attack_type = rng.integers(0, 3)
+        if attack_type == 0:
+            samples.append([rng.integers(100, 500), rng.uniform(0.0, 0.1), rng.uniform(0, 200_000)])
+        elif attack_type == 1:
+            samples.append([rng.integers(20, 100),  rng.uniform(0.5, 1.0), rng.uniform(0, 100_000)])
+        else:
+            samples.append([rng.integers(5, 50),    rng.uniform(0.0, 0.2), rng.uniform(1e9, 1e11)])
+    return np.array(samples, dtype=np.float64)
+
+
+class AnomalyDetectorEngine:
+
+    def __init__(self):
+        if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
+            self._load_local()
+            return
+        try:
+            s3.download_file(MODEL_BUCKET, MODEL_KEY, MODEL_PATH)
+            s3.download_file(MODEL_BUCKET, SCALER_KEY, SCALER_PATH)
+            self._load_local()
+            print("[AnomalyEngine] Model loaded from S3.")
+        except Exception as exc:
+            print(f"[AnomalyEngine] No model in S3 ({exc}) — training fresh and uploading.")
+            self._train()
+
+    def _train(self):
+        from sklearn.ensemble import IsolationForest
+        from sklearn.preprocessing import StandardScaler
+
+        X = np.vstack([_generate_normal_samples(2000), _generate_attack_samples(200)])
+        self.scaler = StandardScaler()
+        X_scaled    = self.scaler.fit_transform(X)
+        self.model  = IsolationForest(n_estimators=300, max_samples="auto", contamination=0.03, random_state=42)
+        self.model.fit(X_scaled)
+
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(self.model, f)
+        with open(SCALER_PATH, "wb") as f:
+            pickle.dump(self.scaler, f)
+
+        try:
+            s3.upload_file(MODEL_PATH, MODEL_BUCKET, MODEL_KEY)
+            s3.upload_file(SCALER_PATH, MODEL_BUCKET, SCALER_KEY)
+            print("[AnomalyEngine] Model trained and uploaded to S3.")
+        except Exception as exc:
+            print(f"[AnomalyEngine] Trained locally but S3 upload failed: {exc}")
+
+    def _load_local(self):
+        with open(MODEL_PATH, "rb") as f:
+            self.model = pickle.load(f)
+        with open(SCALER_PATH, "rb") as f:
+            self.scaler = pickle.load(f)
+
+    def score(self, features: dict) -> dict:
+        if ENABLE_RULES:
+            rule_result = rule_based_check(features)
+            if rule_result:
+                return rule_result
+
+        vec        = np.array([[features.get(col, 0) for col in FEATURE_COLS]], dtype=np.float64)
+        vec_scaled = self.scaler.transform(vec)
+        score      = float(self.model.decision_function(vec_scaled)[0])
+        is_anomaly = score < IF_THRESHOLD
+
+        # Four-band severity from the anomaly score. The lower (more negative)
+        # the Isolation Forest score, the more isolated/abnormal the point, so
+        # the higher the severity. A non-Malaysian source IP (geo_anomaly=1)
+        # nudges the two lowest bands up one level, reflecting the SME threat
+        # model where foreign traffic is somewhat more suspicious — without
+        # collapsing every foreign hit into CRITICAL.
+        severity = "NONE"
+        if is_anomaly:
+            if score < -0.28:
+                severity = "CRITICAL"
+            elif score < -0.18:
+                severity = "HIGH"
+            elif score < -0.08:
+                severity = "MEDIUM"
+            else:
+                severity = "LOW"
+
+            if features.get("geo_anomaly", 0) == 1:
+                bump = {"LOW": "MEDIUM", "MEDIUM": "HIGH"}
+                severity = bump.get(severity, severity)
+
+        return {
+            "is_anomaly":  is_anomaly,
+            "score":       round(score, 6),
+            "threshold":   IF_THRESHOLD,
+            "reason":      self._explain(features, score) if is_anomaly else "",
+            "method":      "isolation_forest",
+            "severity":    severity,
+            "geo_anomaly": int(features.get("geo_anomaly", 0)),
+            "timestamp":   datetime.utcnow().isoformat(),
+        }
+
+    def _explain(self, f: dict, score: float) -> str:
+        reasons = []
+        if f.get("failed_status_rate", 0) > 0.3:
+            reasons.append("Suspicious HTTP failure rate (%.1f%%)" % (f["failed_status_rate"] * 100))
+        if f.get("total_requests", 0) > 50:
+            reasons.append("Elevated request volume (%d)" % f["total_requests"])
+        if f.get("payload_size_variance", 0) > 1e9:
+            reasons.append("Anomalous payload size variance")
+        if f.get("geo_anomaly", 0) == 1:
+            reasons.append("Non-Malaysian IP address")
+        if not reasons:
+            reasons.append("Statistical anomaly (score=%.4f)" % score)
+        return "; ".join(reasons)

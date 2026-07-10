@@ -49,7 +49,7 @@ CORS(app, resources={r"/*": {"origins": [
 
 # ── AWS / LocalStack Clients ──────────────────────────────────────────────────
 LOCALSTACK_URL = os.environ.get("LOCALSTACK_URL", "http://localhost:4566")
-AWS_REGION     = "us-east-1"
+AWS_REGION     = "ap-southeast-1"
 _AWS = dict(
     region_name=AWS_REGION,
     aws_access_key_id="test",

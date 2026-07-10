@@ -32,7 +32,7 @@ _alert_state_lock = threading.Lock()
 SEVERITY_RANK     = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
 _AWS = dict(
-    region_name=AWS_REGION,
+    region_name="ap-southeast-1",
     aws_access_key_id="test",
     aws_secret_access_key="test",
     endpoint_url=LOCALSTACK_URL,

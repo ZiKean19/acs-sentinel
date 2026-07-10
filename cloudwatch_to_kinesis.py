@@ -17,8 +17,8 @@ from botocore.exceptions import ClientError
 # Config
 # ─────────────────────────────────────────────
 LOCALSTACK_URL  = "http://localhost:4566"
-AWS_REGION      = "us-east-1"
-ACCOUNT_ID      = "000000000000"   # LocalStack default
+AWS_REGION      = "ap-southeast-1"
+ACCOUNT_ID      = "567017109835"   
 
 LOG_GROUP       = "security-logs"
 LOG_STREAM      = "app-events"

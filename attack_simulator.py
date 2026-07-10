@@ -115,56 +115,51 @@ def brute_force_login(attempts: int = 80):
 
 def low_severity_anomaly():
     separator("STEP 2 [RULE -> LOW] Geo-Anomaly + Slow Brute Force — Foreign IP")
-    info("Rule triggers: geo_anomaly=1 (foreign IP) + failed_status_rate raises")
     ip      = random_public_ip()
     headers = {"X-Forwarded-For": ip}
     info("Spoofing IP: %s  (geo_anomaly=1)" % ip)
     count = 0
     for i in range(8):
         try:
-            SESSION.post(
-                BASE_URL + "/login",
-                json={"username": "", "password": "wrong%d" % i},
-                headers=headers,
-                timeout=10,
-            )
+            SESSION.post(BASE_URL + "/login", json={"username": "", "password": "wrong%d" % i},
+                         headers=headers, timeout=10)
             count += 1
         except Exception as e:
             warn(str(e))
+        # interleave successful requests to keep failure rate in the LOW band
+        try:
+            SESSION.get(BASE_URL + "/", headers=headers, timeout=10)
+            SESSION.get(BASE_URL + "/", headers=headers, timeout=10)
+        except Exception:
+            pass
         time.sleep(0.9)
-    ok("Sent %d failed login requests -> expect RULE detection, LOW severity" % count)
+    ok("Sent %d failed login requests (diluted) -> expect RULE detection, LOW severity" % count)
 
 
 # ── STEP 3 — Mass File Upload ─────────────────────────────────────────────────
 
 def medium_severity_anomaly(count: int = 16):
-    separator("STEP 3 [RULE -> MEDIUM] Mass File Upload — Malaysian IP")
-    info("Rule triggers: payload_size_variance will spike significantly")
-    ip      = random_malaysian_ip()
-    headers = {"X-Forwarded-For": ip}
-    info("Spoofing IP: %s  (geo_anomaly=0)" % ip)
-    tmp = "medium_test_file.pdf"
-    with open(tmp, "wb") as f:
-        f.write(b"%PDF-1.4\n" + b"X" * 512_000)
+    ...
     done = 0
     for i in range(count):
+        size = random.randint(400_000, 650_000)  # was fixed 512_000
+        tmp  = "medium_test_file_%d.pdf" % i
+        with open(tmp, "wb") as f:
+            f.write(b"%PDF-1.4\n" + b"X" * size)
         try:
             with open(tmp, "rb") as f:
-                SESSION.post(
-                    BASE_URL + "/upload",
-                    files={"file": ("mal_%d.pdf" % i, f, "application/pdf")},
-                    data={"paper_type": "simili_bw", "copies": "1"},
-                    headers=headers,
-                    timeout=5,
-                )
+                SESSION.post(BASE_URL + "/upload",
+                             files={"file": ("mal_%d.pdf" % i, f, "application/pdf")},
+                             data={"paper_type": "simili_bw", "copies": "1"},
+                             headers=headers, timeout=5)
             done += 1
         except Exception as e:
             warn(str(e))
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
         time.sleep(0.3)
-    try:
-        os.remove(tmp)
-    except Exception:
-        pass
     ok("Sent %d upload requests -> expect RULE detection, MEDIUM severity" % done)
 
 
@@ -299,8 +294,9 @@ def stealth_ml_attack():
     info("  Stage B: 9 large file uploads (spikes payload_size_variance feature)...")
     tmp = "stealth_large.pdf"
     for i in range(9):
+        size = random.randint(2_990_000, 3_010_000)  # was fixed 3 MB
         with open(tmp, "wb") as f:
-            f.write(b"%PDF-1.4\n" + b"X" * (1024 * 1024 * 3))  # 3 MB
+            f.write(b"%PDF-1.4\n" + b"X" * size)
         try:
             with open(tmp, "rb") as f:
                 SESSION.post(
