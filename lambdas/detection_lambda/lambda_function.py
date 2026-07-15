@@ -267,6 +267,27 @@ def _write_alert(ip: str, features: dict, result: dict):
         print(f"[ERROR] Failed to write alert: {exc}")
 
 
+SEVERITY_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+
+
+def _existing_block_severity(ip: str):
+    """
+    Return the severity string of this IP's active blocklist entry, or None if
+    it isn't currently blocked. Used to deduplicate repeated detections while
+    still allowing severity *escalation*: if a later detection is more severe
+    than the recorded one (e.g. a flood that starts as HIGH and grows to
+    CRITICAL), we upgrade the alert/block rather than suppressing it.
+    """
+    try:
+        resp = dynamo.get_item(TableName=BLOCKLIST_TABLE, Key={"ip": {"S": ip}})
+        item = resp.get("Item")
+        if not item:
+            return None
+        return item.get("severity", {}).get("S", "LOW")
+    except Exception:
+        return None  # on error, treat as not blocked — better a dup than a miss
+
+
 def _block_ip(ip: str, features: dict, result: dict):
     severity    = result.get("severity", "MEDIUM")
     ttl_seconds = TTL_BY_SEVERITY.get(severity, 3600)
@@ -293,21 +314,41 @@ def _block_ip(ip: str, features: dict, result: dict):
         _add_ip_to_waf_set(ip)
 
 
-def _add_ip_to_waf_set(ip: str):
-    """Adds /32 CIDR of the IP to the WAF IP Set (idempotent-ish: get, merge, update)."""
-    try:
-        resp = wafv2.get_ip_set(Name=WAF_IPSET_NAME, Scope=WAF_IPSET_SCOPE, Id=WAF_IPSET_ID)
-        addresses = set(resp["IPSet"]["Addresses"])
-        addresses.add(f"{ip}/32")
-        wafv2.update_ip_set(
-            Name=WAF_IPSET_NAME,
-            Scope=WAF_IPSET_SCOPE,
-            Id=WAF_IPSET_ID,
-            Addresses=list(addresses),
-            LockToken=resp["LockToken"],
-        )
-    except Exception as exc:
-        print(f"[WARN] WAF IP Set update failed: {exc}")
+def _add_ip_to_waf_set(ip: str, max_retries: int = 5):
+    """
+    Add /32 CIDR of the IP to the WAF IP Set.
+
+    Concurrent invocations (e.g. a burst of attack requests) may each try to
+    update the same IP Set at once. WAF uses optimistic locking via a LockToken,
+    so simultaneous writers collide with WAFOptimisticLockException. We retry
+    with a fresh token and a short backoff; the operation is idempotent (adding
+    an IP already present is a no-op), so retrying is safe.
+    """
+    import random
+    for attempt in range(max_retries):
+        try:
+            resp = wafv2.get_ip_set(Name=WAF_IPSET_NAME, Scope=WAF_IPSET_SCOPE, Id=WAF_IPSET_ID)
+            addresses = set(resp["IPSet"]["Addresses"])
+            cidr = f"{ip}/32"
+            if cidr in addresses:
+                return  # already blocked — nothing to do (idempotent)
+            addresses.add(cidr)
+            wafv2.update_ip_set(
+                Name=WAF_IPSET_NAME,
+                Scope=WAF_IPSET_SCOPE,
+                Id=WAF_IPSET_ID,
+                Addresses=list(addresses),
+                LockToken=resp["LockToken"],
+            )
+            return  # success
+        except wafv2.exceptions.WAFOptimisticLockException:
+            # Another invocation updated the set first; back off and retry.
+            time.sleep(0.2 * (attempt + 1) + random.uniform(0, 0.2))
+            continue
+        except Exception as exc:
+            print(f"[WARN] WAF IP Set update failed: {exc}")
+            return
+    print(f"[WARN] WAF IP Set update gave up after {max_retries} retries for {ip}")
 
 
 def _send_telegram(ip: str, features: dict, result: dict):
@@ -334,7 +375,7 @@ def _send_telegram(ip: str, features: dict, result: dict):
         url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         params = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "reply_markup": json.dumps(reply_markup)}
         data   = urllib.parse.urlencode(params).encode()
-        urllib.request.urlopen(urllib.request.Request(url, data=data, method="POST"), timeout=5)
+        urllib.request.urlopen(urllib.request.Request(url, data=data, method="POST"), timeout=2)
     except Exception as exc:
         print(f"[WARN] Telegram send failed: {exc}")
 
@@ -370,6 +411,17 @@ def _process_events(log_events, engine) -> int:
             print(f"[ERROR] Failed to write log entry: {exc}")
 
         if result["is_anomaly"]:
+            # Dedup WITH escalation: if this IP is already blocked at an equal or
+            # higher severity, skip (avoids duplicate-alert spam from a burst).
+            # But if the new detection is MORE severe (e.g. a flood that grows
+            # from HIGH to CRITICAL as its window fills), upgrade the alert and
+            # block so the recorded severity reflects the worst observed threat.
+            new_sev  = result.get("severity", "MEDIUM")
+            prior_sev = _existing_block_severity(ip)
+            if prior_sev is not None:
+                if SEVERITY_RANK.get(new_sev, 0) <= SEVERITY_RANK.get(prior_sev, 0):
+                    continue  # not more severe — suppress duplicate
+                # else: fall through to re-write at the higher severity (escalation)
             _write_alert(ip, features, result)
             _block_ip(ip, features, result)
             _send_telegram(ip, features, result)

@@ -1,6 +1,12 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
-import { Shield, Activity, Ban, Bell, Terminal, Wifi, WifiOff, LogOut, Sun, Moon, RefreshCw, Info, Globe, Clock, AlertTriangle, History } from 'lucide-react'
-import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, AreaChart, Area, Legend } from 'recharts'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import {
+  Shield, ShieldCheck, Activity, Ban, Bell, Terminal, LogOut, Sun, Moon,
+  RefreshCw, X, Search, AlertTriangle, AlertCircle, MinusCircle,
+  CheckCircle2, History, Wifi, WifiOff, Inbox,
+} from 'lucide-react'
+import {
+  AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid,
+} from 'recharts'
 import { fetchAlerts, fetchBlockedIPs, fetchLogs, unblockIP } from './api/client'
 import type { Alert, BlockedIP, LogEntry } from './api/client'
 import { usePolling } from './hooks/usePolling'
@@ -8,7 +14,15 @@ import { signIn, signOut } from './api/auth'
 
 export type { Alert, BlockedIP, LogEntry }
 
+/* ══════════════════════════════════════════════════════════════════════════
+   Constants & helpers
+   ══════════════════════════════════════════════════════════════════════════ */
+
 const MYT = 'Asia/Kuala_Lumpur'
+
+/** Isolation Forest alert threshold — must mirror IF_THRESHOLD in the
+ *  Detection Lambda. Scores below this are treated as anomalous. */
+const IF_THRESHOLD = -0.02
 
 function parseTS(ts: string): Date {
   if (!ts) return new Date()
@@ -20,139 +34,223 @@ function formatTime(ts: string): string {
   const timeStr = d.toLocaleTimeString('en-MY', { timeZone: MYT, hour12: false })
   return `${dateStr} ${timeStr}`
 }
+function formatClock(t: number): string {
+  return new Date(t).toLocaleTimeString('en-MY', { timeZone: MYT, hour12: false, hour: '2-digit', minute: '2-digit' })
+}
+/** Minus sign (U+2212) rather than hyphen: aligns with tabular figures. */
+const num = (n: number, dp = 4) => n.toFixed(dp).replace('-', '−')
+const plural = (n: number, one: string, many: string) => (n === 1 ? one : many)
 
 type Theme = 'dark' | 'light'
 function applyTheme(theme: Theme) { document.documentElement.setAttribute('data-theme', theme) }
 
+type SevKey = 'critical' | 'high' | 'medium' | 'low' | 'unknown'
+const sevKey = (s: string): SevKey => {
+  const k = (s || '').toLowerCase()
+  return (['critical', 'high', 'medium', 'low'].includes(k) ? k : 'unknown') as SevKey
+}
+const titleCase = (s: string) => (s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : 'Unknown')
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Primitives
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/** Severity is carried by colour AND icon AND word — never colour alone.
+ *  Roughly 8% of men have some colour-vision deficiency; a red/amber pill
+ *  pair is exactly the confusion these users hit. */
+function SeverityPill({ severity }: { severity: string }) {
+  const k = sevKey(severity)
+  const Icon = { critical: AlertTriangle, high: AlertCircle, medium: MinusCircle, low: CheckCircle2, unknown: MinusCircle }[k]
+  return (
+    <span className={`sev sev-${k}`}>
+      <Icon size={11} strokeWidth={2.6} aria-hidden="true" />
+      {titleCase(severity)}
+    </span>
+  )
+}
+
+function IpCell({ ip, geoAnomaly }: { ip: string, geoAnomaly?: boolean | string }) {
+  const foreign = geoAnomaly === true || geoAnomaly === 'true'
+  return (
+    <span className="ip" title={foreign ? `${ip} — originates outside Malaysia` : `${ip} — Malaysian address`}>
+      <span className="flagmark" aria-hidden="true">{foreign ? '🌐' : '🇲🇾'}</span>
+      {ip}
+      {foreign && <span className="foreign">Foreign</span>}
+    </span>
+  )
+}
+
+function ThemeButton({ theme, toggleTheme }: { theme: Theme, toggleTheme: () => void }) {
+  return (
+    <button className="btn ghost" onClick={toggleTheme}
+      aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+      title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
+      {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+    </button>
+  )
+}
+
+function Spinner({ label = 'Loading…' }: { label?: string }) {
+  return (
+    <div className="empty">
+      <RefreshCw size={18} className="spin icon" aria-hidden="true" />
+      <p style={{ marginBottom: 0 }}>{label}</p>
+    </div>
+  )
+}
+
+/** Empty states are an invitation, not a shrug: say what happened, why it's
+ *  fine (or not), and offer the next action. */
+function EmptyState({ icon, title, body, action }: {
+  icon: React.ReactNode, title: string, body: string, action?: React.ReactNode
+}) {
+  return (
+    <div className="empty">
+      <div className="icon" aria-hidden="true">{icon}</div>
+      <h4>{title}</h4>
+      <p>{body}</p>
+      {action}
+    </div>
+  )
+}
+
+function SearchBox({ value, onChange, placeholder }: {
+  value: string, onChange: (v: string) => void, placeholder: string
+}) {
+  return (
+    <div className="search">
+      <Search size={15} aria-hidden="true" />
+      <input type="text" value={value} placeholder={placeholder}
+        onChange={e => onChange(e.target.value)} aria-label={placeholder} />
+      {value && (
+        <button className="clear" onClick={() => onChange('')} aria-label="Clear filter" title="Clear">
+          <X size={14} />
+        </button>
+      )}
+    </div>
+  )
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Login
+   ══════════════════════════════════════════════════════════════════════════ */
+
 function LoginScreen({ onLogin, theme, toggleTheme }: { onLogin: () => void, theme: Theme, toggleTheme: () => void }) {
   const [user, setUser] = useState('')
   const [pass, setPass] = useState('')
-  const [err,  setErr]  = useState('')
+  const [err, setErr] = useState('')
   const [loading, setLoading] = useState(false)
 
   const handleLogin = async () => {
+    if (!user || !pass) { setErr('Enter both your username and password.'); return }
     setLoading(true); setErr('')
     try {
       await signIn(user, pass)
       onLogin()
     } catch (e: any) {
-      setErr('ACCESS DENIED — ' + (e?.message || 'Invalid credentials'))
+      // Plain language, and it says what to do next. "ACCESS DENIED" tells the
+      // user they failed; it does not tell them how to succeed.
+      setErr(e?.message || 'We couldn’t sign you in. Check your username and password, then try again.')
       setLoading(false)
     }
   }
 
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'var(--bg-base)' }}>
-      <div style={{ position: 'fixed', top: 16, right: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
-        <Sun size={12} color="var(--accent-amber)" />
-        <button className="theme-toggle" onClick={toggleTheme} title="Toggle theme" />
-        <Moon size={12} color="var(--text-muted)" />
+    <div className="login-wrap">
+      <div style={{ position: 'fixed', top: 16, right: 16 }}>
+        <ThemeButton theme={theme} toggleTheme={toggleTheme} />
       </div>
-      <div className="glass-panel slide-in-right" style={{ width: 360, padding: '40px 32px', background: 'var(--bg-panel)', border: '1px solid var(--border)' }}>
-        <div style={{ textAlign: 'center', marginBottom: 32 }}>
-          <div style={{ width: 56, height: 56, margin: '0 auto 16px', background: 'rgba(0,200,100,0.1)', border: '1px solid var(--accent-green)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <Shield size={28} color="var(--accent-green)" />
+
+      <div className="login">
+        <div className="login-mark"><Shield size={22} strokeWidth={2.2} /></div>
+        <h1>Sign in to ACS Sentinel</h1>
+
+        {err && (
+          <div className="form-error" role="alert">
+            <AlertTriangle size={15} aria-hidden="true" />
+            <span>{err}</span>
           </div>
-          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 18, color: 'var(--accent-green)', letterSpacing: 4 }}>ACS SENTINEL</div>
-          <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-muted)', marginTop: 4, letterSpacing: 2 }}>AUTOMATED CLOUD SECURITY</div>
+        )}
+
+        <div className="field">
+          <label htmlFor="username">Username</label>
+          <input id="username" type="text" value={user} autoComplete="username" autoFocus
+            onChange={e => setUser(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleLogin() }} />
         </div>
-        <div style={{ marginBottom: 16 }}>
-          <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-muted)', letterSpacing: 2, display: 'block', marginBottom: 6 }}>USERNAME</label>
-          <input value={user} onChange={e => setUser(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleLogin()}
-            style={{ width: '100%', padding: '10px 12px', background: 'var(--bg-card)', border: '1px solid var(--border)', color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: 13, outline: 'none' }} />
+        <div className="field">
+          <label htmlFor="password">Password</label>
+          <input id="password" type="password" value={pass} autoComplete="current-password"
+            onChange={e => setPass(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleLogin() }} />
         </div>
-        <div style={{ marginBottom: 24 }}>
-          <label style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-muted)', letterSpacing: 2, display: 'block', marginBottom: 6 }}>PASSWORD</label>
-          <input type="password" value={pass} onChange={e => setPass(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleLogin()}
-            style={{ width: '100%', padding: '10px 12px', background: 'var(--bg-card)', border: '1px solid var(--border)', color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: 13, outline: 'none' }} />
-        </div>
-        {err && <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent-red)', marginBottom: 16, padding: '8px 12px', background: 'rgba(220,38,38,0.08)', border: '1px solid rgba(220,38,38,0.3)' }}>{err}</div>}
-        <button onClick={handleLogin} disabled={loading}
-          style={{ width: '100%', padding: '12px', background: loading ? 'rgba(0,200,100,0.08)' : 'rgba(0,200,100,0.12)', border: '1px solid var(--accent-green)', color: 'var(--accent-green)', fontFamily: 'var(--font-mono)', fontSize: 12, letterSpacing: 3, cursor: loading ? 'wait' : 'pointer' }}>
-          {loading ? 'AUTHENTICATING...' : 'AUTHENTICATE'}
+
+        <button className="btn primary block" onClick={handleLogin} disabled={loading} style={{ height: 40, marginTop: 6 }}>
+          {loading ? <><RefreshCw size={14} className="spin" />Signing in…</> : 'Sign in'}
         </button>
-        <div style={{ marginTop: 16, fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', textAlign: 'center' }}>Cognito authentication</div>
       </div>
     </div>
   )
 }
 
-function SeverityBadge({ severity }: { severity: string }) {
-  const colors: Record<string, string> = { CRITICAL: 'var(--accent-red)', HIGH: '#f97316', MEDIUM: 'var(--accent-amber)', LOW: 'var(--accent-green)' }
-  const color = colors[severity] || 'var(--text-muted)'
-  return (
-    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, letterSpacing: 1, color, border: `1px solid ${color}`, padding: '2px 6px', background: `${color}18`, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-      {severity === 'CRITICAL' && <AlertTriangle size={10} />}{severity}
-    </span>
-  )
-}
+/* ══════════════════════════════════════════════════════════════════════════
+   Status band — the one question an SME owner actually has
+   ══════════════════════════════════════════════════════════════════════════ */
 
-function IPWithGeo({ ip, geoAnomaly }: { ip: string, geoAnomaly?: number }) {
-  const isMY = geoAnomaly !== 1
-  return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 11 }}>
-      <span title={isMY ? 'Malaysia' : 'Foreign IP'}>{isMY ? '🇲🇾' : <Globe size={11} color="var(--accent-blue)" />}</span>
-      <span style={{ color: 'var(--accent-blue)' }}>{ip}</span>
-    </div>
-  )
-}
+function StatusBand({ alerts, blockedIPs, logs, anyError, connected }: {
+  alerts: Alert[], blockedIPs: BlockedIP[], logs: LogEntry[], anyError: boolean, connected: boolean
+}) {
+  const now = Date.now()
 
-function RiskCard({ alert, onClose }: { alert: Alert, onClose: () => void }) {
+  const lastHour = useMemo(
+    () => alerts.filter(a => now - parseTS(a.timestamp).getTime() < 3_600_000),
+    [alerts, now],
+  )
+
+  const longestBlock = useMemo(() => {
+    const secs = Date.now() / 1000
+    const remaining = blockedIPs.map(b => (b.ttl ? b.ttl - secs : 0)).filter(v => v > 0)
+    if (!remaining.length) return null
+    const t = Math.max(...remaining)
+    const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60)
+    return h > 0 ? `${h} h ${m} m` : `${m} m`
+  }, [blockedIPs])
+
+  let tone: 'calm' | 'active' | 'critical' = 'calm'
+  let lead = 'All clear.'
+  let highlight = 'No threats in the last hour.'
+  let sub = 'Sentinel is watching every request to your portal. You’ll see a notification here the moment something looks wrong.'
+
+  if (anyError) {
+    tone = 'critical'
+    lead = 'Sentinel can’t reach'
+    highlight = 'the detection service.'
+    sub = 'What you see below may be out of date. Blocking rules already in AWS WAF stay active regardless. Retrying automatically every 4 seconds.'
+  } else if (lastHour.length > 0) {
+    tone = 'active'
+    lead = 'You’re covered.'
+    highlight = `${lastHour.length} ${plural(lastHour.length, 'threat was', 'threats were')} handled in the last hour.`
+    sub = blockedIPs.length > 0
+      ? `Nothing needs your attention — Sentinel blocked ${plural(blockedIPs.length, 'the source', 'each source')} automatically. ${longestBlock ? `The longest block lifts in ${longestBlock}.` : 'Blocks lift on their own.'} Open Blocked IPs to unblock early.`
+      : 'These were logged for monitoring only and did not meet the threshold for an automatic block.'
+  }
+
   return (
-    <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 20 }} onClick={onClose}>
-      <div className="glass-panel slide-in-right" style={{ width: '100%', maxWidth: 500, background: 'var(--bg-panel)', border: '1px solid var(--border)', position: 'relative' }} onClick={e => e.stopPropagation()}>
-        <div style={{ height: 4, background: alert.severity === 'CRITICAL' ? 'var(--accent-red)' : 'var(--accent-amber)' }} />
-        <div style={{ padding: 24 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20 }}>
-            <div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)', letterSpacing: 2 }}>THREAT ANALYSIS REPORT</div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 18, color: 'var(--text-primary)', marginTop: 4, fontWeight: 'bold' }}>{alert.type}</div>
-            </div>
-            <SeverityBadge severity={alert.severity} />
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 24 }}>
-            <div style={{ background: 'var(--bg-card)', padding: 12, border: '1px solid var(--border)' }}>
-              <div style={{ fontSize: 9, color: 'var(--text-dim)', marginBottom: 4 }}>SOURCE IP</div>
-              <IPWithGeo ip={alert.source_ip} geoAnomaly={alert.geo_anomaly} />
-            </div>
-            <div style={{ background: 'var(--bg-card)', padding: 12, border: '1px solid var(--border)' }}>
-              <div style={{ fontSize: 9, color: 'var(--text-dim)', marginBottom: 4 }}>ANOMALY SCORE</div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 14, color: 'var(--accent-blue)' }}>{alert.score.toFixed(4)}</div>
-            </div>
-          </div>
-          <div style={{ marginBottom: 24 }}>
-            <div style={{ fontSize: 10, color: 'var(--text-dim)', marginBottom: 8, fontFamily: 'var(--font-mono)' }}>DETECTION REASON</div>
-            <div style={{ background: 'rgba(0,0,0,0.2)', padding: 12, borderLeft: '2px solid var(--accent-blue)', color: 'var(--text-muted)', fontSize: 11, fontStyle: 'italic' }}>"{alert.reason}"</div>
-          </div>
-          <button onClick={onClose} style={{ width: '100%', padding: 12, background: 'var(--border)', border: 'none', color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: 11, cursor: 'pointer', letterSpacing: 2 }}>
-            DISMISS REPORT
-          </button>
-        </div>
+    <section className={`status tone-${tone}`} aria-live="polite">
+      <div className="spine" />
+      <div className="body">
+        <div className="eyebrow">Right now</div>
+        <h1 className="verdict">{lead} <em>{highlight}</em></h1>
+        <p className="subline">{sub}</p>
       </div>
-    </div>
+      <RiskMeter logs={logs} connected={connected} />
+    </section>
   )
 }
 
-function AlertBanner({ alerts }: { alerts: Alert[] }) {
-  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 }
-  alerts.forEach(a => { if (a.severity in counts) counts[a.severity as keyof typeof counts]++ })
-  return (
-    <div style={{ display: 'flex', gap: 12, padding: '12px 0' }}>
-      {Object.entries(counts).map(([sev, count]) => {
-        const colors: Record<string, string> = { CRITICAL: 'var(--accent-red)', HIGH: '#f97316', MEDIUM: 'var(--accent-amber)', LOW: 'var(--accent-green)' }
-        const color = colors[sev]
-        return (
-          <div className="glass-panel" key={sev} style={{ flex: 1, padding: '14px 16px', background: count > 0 ? `${color}12` : 'var(--bg-card)', border: `1px solid ${count > 0 ? color : 'var(--border)'}`, display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 22, color: count > 0 ? color : 'var(--text-dim)', fontWeight: 'bold' }}>{count}</div>
-            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-muted)', letterSpacing: 2 }}>{sev}</div>
-          </div>
-        )
-      })}
-    </div>
-  )
-}
-
-function RiskGauge({ logs }: { logs: LogEntry[] }) {
+/** The old gauge showed "63.4%" — a number with no unit and no instruction.
+ *  Same maths, but reported as a band the user can act on. */
+function RiskMeter({ logs, connected }: { logs: LogEntry[], connected: boolean }) {
   const currentScore = useMemo(() => {
     if (!logs || logs.length === 0) return 0.1
     const sorted = [...logs].sort((a, b) => b.timestamp.localeCompare(a.timestamp))
@@ -160,140 +258,350 @@ function RiskGauge({ logs }: { logs: LogEntry[] }) {
   }, [logs])
 
   let riskPercent = 0
-  if (currentScore >= 0.1)       { riskPercent = 0 }
+  if (currentScore >= 0.1) { riskPercent = 0 }
   else if (currentScore >= 0.031) { riskPercent = ((0.1 - currentScore) / (0.1 - 0.031)) * 50 }
   else { riskPercent = 50 + ((0.031 - Math.max(-1.0, currentScore)) / (0.031 + 1.0)) * 50 }
-  riskPercent = Math.min(riskPercent, 100)
+  riskPercent = Math.min(Math.max(riskPercent, 0), 100)
 
-  const arcLength = 126
-  const strokeDashoffset = arcLength - (arcLength * riskPercent) / 100
-  const color = riskPercent > 80 ? 'var(--accent-red)' : riskPercent > 40 ? 'var(--accent-amber)' : 'var(--accent-green)'
+  const band = riskPercent > 80 ? 'Act now' : riskPercent > 40 ? 'Watch' : 'Normal'
+  const bandClass = riskPercent > 80 ? 'b-act' : riskPercent > 40 ? 'b-watch' : ''
+  const note = riskPercent > 80
+    ? 'The model is seeing traffic well outside its trained baseline. Check the alerts below.'
+    : riskPercent > 40
+      ? 'Busier than usual, but nothing the model can’t handle on its own.'
+      : 'Traffic matches the trained baseline for this portal.'
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
-      <svg width="120" height="65" viewBox="0 0 100 55">
-        <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="var(--bg-panel)" strokeWidth="10" strokeLinecap="round" />
-        <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke={color} strokeWidth="10" strokeLinecap="round" strokeDasharray={arcLength} strokeDashoffset={strokeDashoffset} style={{ transition: 'stroke-dashoffset 0.5s ease-out, stroke 0.5s' }} />
-        <text x="50" y="45" textAnchor="middle" fill={color} fontSize="16" fontFamily="var(--font-mono)" fontWeight="bold">{riskPercent.toFixed(1)}%</text>
-      </svg>
-      <div style={{ textAlign: 'center', fontFamily: 'var(--font-mono)' }}>
-        <div style={{ fontSize: 10, color: 'var(--text-muted)', letterSpacing: 2, marginBottom: 4 }}>LIVE AI RISK</div>
-        <div style={{ fontSize: 11, color: 'var(--text-primary)' }}>{currentScore.toFixed(4)}</div>
+    <div className="meter">
+      <div className="meter-head">
+        <span className={`meter-band ${bandClass}`}>{connected ? band : '—'}</span>
+        <span className="meter-score">score {num(currentScore)}</span>
+      </div>
+      <div className="meter-track"
+        role="meter" aria-valuenow={Math.round(riskPercent)} aria-valuemin={0} aria-valuemax={100}
+        aria-label={`Current risk level: ${band}`}>
+        <i /><i /><i />
+        <span className="meter-needle" style={{ left: `${riskPercent}%` }} />
+      </div>
+      <div className="meter-scale"><span>Normal</span><span>Watch</span><span>Act now</span></div>
+      <p className="meter-note">{note}</p>
+    </div>
+  )
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Severity ledger
+   ══════════════════════════════════════════════════════════════════════════ */
+
+function SeverityLedger({ alerts }: { alerts: Alert[] }) {
+  const counts = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 }
+  alerts.forEach(a => { if (a.severity in counts) counts[a.severity as keyof typeof counts]++ })
+
+  return (
+    <div className="ledger">
+      {(Object.entries(counts) as [keyof typeof counts, number][]).map(([sev, count]) => {
+        const k = sevKey(sev)
+        return (
+          <div className={`tile ${count === 0 ? 'zero' : ''}`} key={sev}>
+            <span className="bar" style={{ background: `var(--sev-${k})` }} />
+            <div>
+              <div className="n" style={{ color: count > 0 ? `var(--sev-${k}-fg)` : undefined }}>{count}</div>
+              <div className="l">{titleCase(sev)}</div>
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Anomaly chart
+   ══════════════════════════════════════════════════════════════════════════ */
+
+function ChartTooltip({ active, payload, label }: any) {
+  if (!active || !payload?.length) return null
+  const p = payload[0].payload
+  return (
+    <div style={{
+      background: 'var(--chart-tooltip-bg)', border: '1px solid var(--chart-tooltip-border)',
+      borderRadius: 8, padding: '9px 11px', fontSize: 12.5, boxShadow: 'var(--shadow)',
+    }}>
+      <div style={{ color: 'var(--text-3)', marginBottom: 5, fontFamily: "'IBM Plex Mono', monospace" }}>
+        {new Date(label).toLocaleTimeString('en-MY', { timeZone: MYT, hour12: false })}
+      </div>
+      <div style={{ fontWeight: 600, marginBottom: 3 }}>{p.type}</div>
+      <div style={{ fontFamily: "'IBM Plex Mono', monospace", color: 'var(--text-2)' }}>
+        {p.ip} · score {num(p.score)}
       </div>
     </div>
   )
 }
 
-function AnomalyChart({ alerts }: { alerts: Alert[] }) {
-  const data = useMemo(() => {
-    return [...alerts]
+function AnomalyChart({ alerts, onRunSim }: { alerts: Alert[], onRunSim?: () => void }) {
+  const data = useMemo(() => (
+    [...alerts]
       .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
       .slice(-40)
-      .map(a => ({ time: parseTS(a.timestamp).getTime(), score: Math.abs(a.score), severity: a.severity }))
-  }, [alerts])
+      // Raw score, not Math.abs(): the sign is the signal. Isolation Forest
+      // returns negative for anomalies, so folding it positive threw away the
+      // only thing the threshold line means.
+      .map(a => ({
+        time: parseTS(a.timestamp).getTime(),
+        score: typeof a.score === 'number' ? a.score : 0,
+        severity: a.severity,
+        type: a.type,
+        ip: a.source_ip,
+      }))
+  ), [alerts])
+
+  if (data.length === 0) {
+    return (
+      <EmptyState
+        icon={<Activity size={22} />}
+        title="No detections yet"
+        body="Sentinel hasn’t scored any traffic in this window. Run the attack simulator to generate sample traffic, or wait for live requests to arrive."
+        action={onRunSim && <button className="btn" onClick={onRunSim}>Refresh now</button>}
+      />
+    )
+  }
 
   return (
-    <div style={{ height: 250 }}>
-      {data.length === 0 ? (
-        <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-dim)' }}>
-          NO ANOMALY DATA — RUN ATTACK SIMULATOR
-        </div>
-      ) : (
+    <>
+      <div className="chart-wrap">
         <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{ top: 10, right: 10, bottom: 0, left: -20 }}>
+          <AreaChart data={data} margin={{ top: 6, right: 12, bottom: 0, left: 0 }}>
             <defs>
-              <linearGradient id="colorScore" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%"  stopColor="var(--accent-blue)" stopOpacity={0.3} />
-                <stop offset="95%" stopColor="var(--accent-blue)" stopOpacity={0} />
+              <linearGradient id="scoreFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="var(--brand)" stopOpacity={0.22} />
+                <stop offset="100%" stopColor="var(--brand)" stopOpacity={0} />
               </linearGradient>
             </defs>
+            <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
             <XAxis dataKey="time" type="number" domain={['auto', 'auto']} scale="time"
-              tickFormatter={(t) => new Date(t).toLocaleTimeString('en-MY', { hour: '2-digit', minute: '2-digit', timeZone: MYT, hour12: false })}
-              tick={{ fill: 'var(--chart-tick)', fontSize: 9, fontFamily: 'Share Tech Mono' } as any} axisLine={false} tickLine={false} />
-            <YAxis tick={{ fill: 'var(--chart-tick)', fontSize: 9, fontFamily: 'Share Tech Mono' } as any} axisLine={false} tickLine={false} />
-            <Tooltip
-              labelFormatter={(t) => new Date(t).toLocaleTimeString('en-MY', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: MYT, hour12: false })}
-              contentStyle={{ background: 'var(--chart-tooltip-bg)', border: '1px solid var(--border)', fontFamily: 'Share Tech Mono', fontSize: 10 }}
-              labelStyle={{ color: 'var(--text-muted)', marginBottom: 4 }} />
-            <Legend wrapperStyle={{ fontSize: 10, fontFamily: 'var(--font-mono)', paddingTop: 10 }} />
-            <ReferenceLine y={0.5} stroke="var(--accent-red)" strokeOpacity={0.4} strokeDasharray="3 3" label={{ position: 'right', value: 'ALERT', fill: 'var(--accent-red)', fontSize: 9 }} />
-            <Area type="monotone" dataKey="score" stroke="var(--accent-blue)" fillOpacity={1} fill="url(#colorScore)" strokeWidth={2} name="Risk Score" />
+              tickFormatter={formatClock} axisLine={false} tickLine={false}
+              tick={{ fill: 'var(--chart-tick)', fontSize: 12, fontFamily: 'IBM Plex Mono' } as any} />
+            <YAxis width={52} axisLine={false} tickLine={false}
+              tickFormatter={(v: number) => num(v, 2)}
+              tick={{ fill: 'var(--chart-tick)', fontSize: 12, fontFamily: 'IBM Plex Mono' } as any} />
+            <Tooltip content={<ChartTooltip />} cursor={{ stroke: 'var(--line-2)', strokeWidth: 1 }} />
+            <ReferenceLine y={IF_THRESHOLD} stroke="var(--sev-critical)" strokeDasharray="5 4" strokeWidth={1.5} />
+            <Area type="monotone" dataKey="score" stroke="var(--brand)" strokeWidth={2.2}
+              fill="url(#scoreFill)" fillOpacity={1} dot={false} activeDot={{ r: 4 }} name="Anomaly score" />
           </AreaChart>
         </ResponsiveContainer>
+      </div>
+      <div className="legend">
+        <span><i style={{ background: 'var(--brand)' }} />Anomaly score</span>
+        <span><i style={{ background: 'var(--sev-critical)' }} />Alert threshold ({num(IF_THRESHOLD, 2)})</span>
+        <span style={{ color: 'var(--text-3)' }}>Lower is more anomalous</span>
+      </div>
+    </>
+  )
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Alert list + threat report
+   ══════════════════════════════════════════════════════════════════════════ */
+
+function AlertList({ alerts, loading, onSelect }: {
+  alerts: Alert[], loading: boolean, onSelect: (a: Alert) => void
+}) {
+  const sorted = useMemo(
+    () => [...alerts].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || '')).slice(0, 50),
+    [alerts],
+  )
+
+  if (loading && alerts.length === 0) return <Spinner label="Loading alerts…" />
+  if (sorted.length === 0) {
+    return (
+      <EmptyState
+        icon={<ShieldCheck size={22} />}
+        title="No alerts"
+        body="Nothing has crossed the detection threshold. This is the state you want."
+      />
+    )
+  }
+
+  return (
+    <div>
+      {sorted.map(a => {
+        const isML = (a.method || '').toUpperCase().includes('ML') || (a.method || '').toLowerCase().includes('isolation')
+        return (
+          <button key={a.alert_id} className={`row r-${sevKey(a.severity)}`} onClick={() => onSelect(a)}>
+            <span className="cell-sev"><SeverityPill severity={a.severity} /></span>
+            <span className="cell-ip truncate"><IpCell ip={a.source_ip} geoAnomaly={a.geo_anomaly} /></span>
+            <span className="grow">
+              <span className="what">{a.type}</span>
+              <div className="why truncate">{a.reason}</div>
+            </span>
+            <span className={`tag ${isML ? 'ml' : ''} hide-sm`}
+              title={isML ? 'Detected by the Isolation Forest model' : 'Matched a deterministic rule'}>
+              {isML ? 'ML' : 'Rule'}
+            </span>
+            <span className="when hide-sm">{typeof a.score === 'number' ? num(a.score, 3) : '—'}</span>
+            <span className="when">{formatTime(a.timestamp)}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function ThreatReport({ alert, onClose, onUnblock }: {
+  alert: Alert, onClose: () => void, onUnblock: (ip: string) => void
+}) {
+  const closeRef = useRef<HTMLButtonElement>(null)
+  const foreign = alert.geo_anomaly === true || (alert.geo_anomaly as any) === 'true'
+  const isML = (alert.method || '').toUpperCase().includes('ML') || (alert.method || '').toLowerCase().includes('isolation')
+
+  useEffect(() => {
+    closeRef.current?.focus()
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return (
+    <div className="scrim" onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="report-title">
+        <div className="modal-head">
+          <div className="grow">
+            <div className="eyebrow" style={{ marginBottom: 6 }}>Threat report</div>
+            <h3 id="report-title">{alert.type}</h3>
+          </div>
+          <SeverityPill severity={alert.severity} />
+          <button ref={closeRef} className="btn ghost" onClick={onClose}
+            aria-label="Close report" title="Close (Esc)" style={{ margin: '-4px -6px 0 2px' }}>
+            <X size={16} />
+          </button>
+        </div>
+
+        <dl className="facts">
+          <div className="fact">
+            <dt>Source address</dt>
+            <dd>{alert.source_ip}</dd>
+          </div>
+          <div className="fact">
+            <dt>Origin</dt>
+            <dd>{foreign ? 'Outside Malaysia' : 'Malaysia'}</dd>
+          </div>
+          <div className="fact">
+            <dt>Anomaly score</dt>
+            <dd>{typeof alert.score === 'number' ? num(alert.score) : '—'}</dd>
+          </div>
+          <div className="fact">
+            <dt>Detected by</dt>
+            <dd>{isML ? 'Isolation Forest' : alert.method || 'Rule engine'}</dd>
+          </div>
+        </dl>
+
+        <div className="modal-body">
+          <h5>Why Sentinel flagged this</h5>
+          <p className="quote">{alert.reason}</p>
+          <h5 style={{ marginTop: 16 }}>What happened next</h5>
+          <p className="modal-note">
+            Detected at {formatTime(alert.timestamp)} (MYT). The source was added to the AWS WAF
+            block list with a severity-proportional TTL and a Telegram notification was sent to the
+            on-call admin. The block lifts automatically when the TTL expires.
+          </p>
+        </div>
+
+        <div className="modal-foot">
+          <button className="btn" onClick={onClose}>Close</button>
+          <button className="btn primary" onClick={() => { onUnblock(alert.source_ip); onClose() }}>
+            Unblock this address
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Log feed
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const lvlClass = (lvl: string) => {
+  const k = (lvl || '').toLowerCase()
+  if (['critical', 'high', 'medium', 'audit', 'info', 'warn'].includes(k)) return `lvl-${k}`
+  return 'lvl-info'
+}
+
+function LogFeed({ logs, loading, error, onRefresh }: {
+  logs: LogEntry[], loading: boolean, error: boolean, onRefresh: () => void
+}) {
+  const [q, setQ] = useState('')
+
+  const filtered = useMemo(() => {
+    const needle = q.toLowerCase().trim()
+    return [...logs]
+      .sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''))
+      .filter(l => !needle || `${l.timestamp} ${l.level} ${l.source_ip} ${l.message} ${l.source || ''}`.toLowerCase().includes(needle))
+  }, [logs, q])
+
+  if (loading && logs.length === 0) return <Spinner label="Loading log stream…" />
+
+  return (
+    <div className="card">
+      <div className="toolbar">
+        <SearchBox value={q} onChange={setQ} placeholder={'Filter by address, level or message'} />
+        <span className="count">{filtered.length} of {logs.length} records</span>
+        <button className="btn sm ghost" onClick={onRefresh} title="Reconnect to the log stream">
+          <RefreshCw size={13} />Reconnect
+        </button>
+      </div>
+
+      {error && (
+        <div className="form-error" style={{ margin: 16, marginBottom: 0 }} role="alert">
+          <AlertTriangle size={15} aria-hidden="true" />
+          <span>The log stream is unreachable. Records below may be stale.</span>
+        </div>
+      )}
+
+      {filtered.length === 0 ? (
+        q ? (
+          <EmptyState
+            icon={<Search size={22} />}
+            title={`No records match “${q}”`}
+            body={`Try a partial address like 175.136, a level like CRITICAL, or clear the filter to see all ${logs.length} records.`}
+            action={<button className="btn" onClick={() => setQ('')}>Clear filter</button>}
+          />
+        ) : (
+          <EmptyState
+            icon={<Inbox size={22} />}
+            title="No log records yet"
+            body="Requests to the portal will appear here within a few seconds of arriving. Run the attack simulator to generate sample traffic."
+          />
+        )
+      ) : (
+        <div className="logs tall">
+          {filtered.map((l, i) => (
+            <div key={l.log_id || i}
+              className={`log ${l.level === 'CRITICAL' ? 'is-critical' : l.level === 'AUDIT' ? 'is-audit' : ''}`}>
+              <time>{formatTime(l.timestamp)}</time>
+              <span className={`lvl ${lvlClass(l.level)}`}>{l.level}</span>
+              <span className="ip" style={{ fontSize: 12.5 }}>{l.source_ip || '—'}</span>
+              <span className="msg">{l.message}</span>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   )
 }
 
-function Spinner() {
-  return (
-    <div style={{ padding: 32, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}>
-      <RefreshCw size={14} color="var(--accent-green)" style={{ animation: 'spin 1s linear infinite' }} />
-      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-muted)' }}>LOADING...</span>
-    </div>
-  )
-}
+/* ══════════════════════════════════════════════════════════════════════════
+   Blocklist
+   ══════════════════════════════════════════════════════════════════════════ */
 
-function LogFeed({ logs, loading, error, onRefresh }: { logs: LogEntry[], loading: boolean, error: boolean, onRefresh: () => void }) {
-  const [searchQuery, setSearchQuery] = useState('')
-
-  const filteredLogs = useMemo(() => {
-    if (!searchQuery) return logs
-    const keywords = searchQuery.toLowerCase().split(/\s+/).filter(k => k.length > 0)
-    return logs.filter(log => {
-      const text = [formatTime(log.timestamp), log.level, log.source_ip, log.message, log.source].join(' ').toLowerCase()
-      return keywords.every(k => text.includes(k))
-    })
-  }, [logs, searchQuery])
-
-  const sortedLogs = useMemo(() => [...filteredLogs].sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, 1000), [filteredLogs])
-
-  const levelColor = (level: string) => {
-    const map: Record<string, string> = { CRITICAL: 'var(--accent-red)', HIGH: '#f97316', MEDIUM: '#eab308', WARN: '#64748b', AUDIT: '#a855f7' }
-    return map[level] || 'var(--accent-green)'
-  }
-
-  if (loading && logs.length === 0) return <Spinner />
-  if (error   && logs.length === 0) return (
-    <div style={{ padding: 16, display: 'flex', alignItems: 'center', gap: 12, fontFamily: 'var(--font-mono)', fontSize: 11 }}>
-      <span style={{ color: 'var(--accent-red)' }}>CONNECTION ERROR — Flask backend unreachable</span>
-      <button onClick={onRefresh} style={{ padding: '4px 10px', background: 'transparent', border: '1px solid var(--border-bright)', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)' }}>RETRY</button>
-    </div>
-  )
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', display: 'flex', flexWrap: 'wrap', gap: 12, background: 'var(--bg-card)', alignItems: 'center' }}>
-        <div style={{ flex: 1, position: 'relative' }}>
-          <Terminal size={12} style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-dim)' }} />
-          <input type="text" placeholder="FILTER BY KEYWORD, IP, LEVEL..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
-            style={{ width: '100%', padding: '10px 12px 10px 32px', background: 'var(--bg-base)', border: '1px solid var(--border)', color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: 11, outline: 'none' }} />
-          {searchQuery && <button onClick={() => setSearchQuery('')} style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', color: 'var(--text-dim)', cursor: 'pointer', fontSize: 14 }}>x</button>}
-        </div>
-        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{sortedLogs.length} / {logs.length} RECORDS</div>
-      </div>
-      <div style={{ height: 600, overflowY: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
-        {sortedLogs.length === 0 ? (
-          <div style={{ padding: '32px 16px', color: 'var(--text-dim)', textAlign: 'center' }}>WAITING FOR LOG DATA...</div>
-        ) : (
-          sortedLogs.map((log, i) => (
-            <div key={log.log_id ? `${log.log_id}-${i}` : `log-${i}`}
-              style={{ padding: '8px 16px', borderBottom: '1px solid var(--bg-base)', display: 'flex', gap: 16, alignItems: 'flex-start', background: log.level === 'CRITICAL' ? 'rgba(220,38,38,0.06)' : log.level === 'AUDIT' ? 'rgba(168,85,247,0.06)' : 'transparent' }}>
-              <span style={{ color: 'var(--text-muted)', flexShrink: 0, width: 110, fontSize: 10 }}>{formatTime(log.timestamp)}</span>
-              <span style={{ color: levelColor(log.level), flexShrink: 0, width: 75, fontWeight: 'bold' }}>[{log.level}]</span>
-              <span style={{ flexShrink: 0, width: 140 }}><IPWithGeo ip={log.source_ip} geoAnomaly={log.geo_anomaly} /></span>
-              <span style={{ color: 'var(--text-primary)', wordBreak: 'break-all', flex: 1 }}>{log.message}</span>
-            </div>
-          ))
-        )}
-      </div>
-    </div>
-  )
-}
-
-function BlocklistPanel({ ips, logs, loading, error, onUnblock, onRefresh }: { ips: BlockedIP[], logs: LogEntry[], loading: boolean, error: boolean, onUnblock: (ip: string) => void, onRefresh: () => void }) {
-  const [searchQuery, setSearchQuery] = useState('')
+function BlocklistPanel({ ips, logs, loading, error, onUnblock, onRefresh }: {
+  ips: BlockedIP[], logs: LogEntry[], loading: boolean, error: boolean,
+  onUnblock: (ip: string) => void, onRefresh: () => void
+}) {
+  const [q, setQ] = useState('')
   const [now, setNow] = useState(Date.now() / 1000)
+  const [pending, setPending] = useState<string | null>(null)
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now() / 1000), 1000)
@@ -301,206 +609,295 @@ function BlocklistPanel({ ips, logs, loading, error, onUnblock, onRefresh }: { i
   }, [])
 
   const sortedIPs = useMemo(() => {
-    const q = searchQuery.toLowerCase()
+    const needle = q.toLowerCase()
     return [...ips]
-      .filter(item => !q || item.ip.toLowerCase().includes(q) || item.reason.toLowerCase().includes(q) || item.severity.toLowerCase().includes(q))
+      .filter(i => !needle || `${i.ip} ${i.reason} ${i.severity}`.toLowerCase().includes(needle))
       .sort((a, b) => (b.blocked_at || '').localeCompare(a.blocked_at || ''))
-  }, [ips, searchQuery])
+  }, [ips, q])
 
-  const auditLogs = useMemo(() => logs.filter(l => l.level === 'AUDIT').slice(0, 50), [logs])
+  const auditLogs = useMemo(
+    () => logs.filter(l => l.level === 'AUDIT')
+      .sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''))
+      .slice(0, 50),
+    [logs],
+  )
 
-  if (loading && ips.length === 0) return <Spinner />
+  const expiringSoon = sortedIPs.filter(i => i.ttl && i.ttl - now > 0 && i.ttl - now < 600).length
+
+  const handleUnblock = async (ip: string) => {
+    setPending(ip)
+    try { await onUnblock(ip) } finally { setPending(null) }
+  }
+
+  if (loading && ips.length === 0) return <Spinner label="Loading blocked addresses…" />
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 12, background: 'var(--bg-card)', alignItems: 'center' }}>
-        <div style={{ flex: 1, position: 'relative' }}>
-          <input type="text" placeholder="FILTER BY IP OR REASON..." value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
-            style={{ width: '100%', padding: '8px 12px', background: 'var(--bg-base)', border: '1px solid var(--border)', color: 'var(--text-primary)', fontFamily: 'var(--font-mono)', fontSize: 11, outline: 'none' }} />
+    <div className="stack">
+      <div className="card">
+        <div className="toolbar">
+          <SearchBox value={q} onChange={setQ} placeholder="Filter blocked addresses by IP, reason or severity" />
+          <span className="count">
+            {sortedIPs.length} blocked{expiringSoon > 0 ? ` · ${expiringSoon} expiring soon` : ''}
+          </span>
+          <button className="btn sm ghost" onClick={onRefresh} title="Reconnect"><RefreshCw size={13} />Reconnect</button>
         </div>
-        <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>{sortedIPs.length} BLOCKED</div>
-      </div>
-      <div style={{ height: 350, overflowY: 'auto', fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+
+        {error && (
+          <div className="form-error" style={{ margin: 16, marginBottom: 0 }} role="alert">
+            <AlertTriangle size={15} aria-hidden="true" />
+            <span>Can’t read the block list right now. Existing WAF rules are still enforced.</span>
+          </div>
+        )}
+
         {sortedIPs.length === 0 ? (
-          <div style={{ padding: '32px 16px', color: 'var(--text-dim)', textAlign: 'center' }}>SYSTEM CLEAN — NO BLOCKED IPs</div>
+          q ? (
+            <EmptyState icon={<Search size={22} />} title={`Nothing matches “${q}”`}
+              body="Try a partial address, or clear the filter to see every blocked address."
+              action={<button className="btn" onClick={() => setQ('')}>Clear filter</button>} />
+          ) : (
+            <EmptyState icon={<ShieldCheck size={22} />} title="Nothing is blocked"
+              body="No address is currently denied at the WAF. Sentinel adds entries here automatically when it detects a threat." />
+          )
         ) : (
-          sortedIPs.map((item, i) => {
-            const timeLeft = item.ttl ? Math.max(0, item.ttl - now) : 0
-            const hours = Math.floor(timeLeft / 3600)
-            const mins  = Math.floor((timeLeft % 3600) / 60)
-            const secs  = Math.floor(timeLeft % 60)
-            return (
-              <div key={`${item.ip}-${i}`} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 16px', borderBottom: '1px solid var(--border)', background: 'var(--bg-card)' }}>
-                <Ban size={12} color="var(--accent-red)" />
-                <div style={{ minWidth: 140 }}><IPWithGeo ip={item.ip} geoAnomaly={item.geo_anomaly} /></div>
-                <div style={{ minWidth: 80 }}><SeverityBadge severity={item.severity} /></div>
-                <span style={{ color: 'var(--text-muted)', flex: 1, fontSize: 10 }}>{item.reason}</span>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 10, minWidth: 90 }}>
-                  <Clock size={10} color="var(--text-dim)" />
-                  {timeLeft > 0 ? <span style={{ color: 'var(--text-dim)' }}>{hours}h {mins}m {secs}s</span> : <span style={{ color: 'var(--accent-amber)' }}>EXPIRED</span>}
+          <div>
+            {sortedIPs.map((item, i) => {
+              const timeLeft = item.ttl ? Math.max(0, item.ttl - now) : 0
+              const h = Math.floor(timeLeft / 3600)
+              const m = Math.floor((timeLeft % 3600) / 60)
+              const s = Math.floor(timeLeft % 60)
+              const label = h > 0 ? `${h}h ${m}m left` : m > 0 ? `${m}m ${s}s left` : `${s}s left`
+              // TTL is severity-proportional; 4h is the longest band we issue.
+              const pct = Math.min(100, (timeLeft / (4 * 3600)) * 100)
+
+              return (
+                <div key={`${item.ip}-${i}`} className={`block-row r-${sevKey(item.severity)}`}>
+                  <span className="cell-sev"><SeverityPill severity={item.severity} /></span>
+                  <span className="cell-ip"><IpCell ip={item.ip} geoAnomaly={item.geo_anomaly} /></span>
+                  <span className="grow truncate block-reason">{item.reason}</span>
+                  <span className="ttl">
+                    <span className={`t ${timeLeft <= 0 ? 'expired' : ''}`}>
+                      {timeLeft > 0 ? label : 'Expired — clearing'}
+                    </span>
+                    <span className="track"><span className="fill" style={{ width: `${pct}%` }} /></span>
+                  </span>
+                  <button className="btn sm" disabled={pending === item.ip}
+                    onClick={() => handleUnblock(item.ip)}
+                    aria-label={`Unblock ${item.ip}`}>
+                    {pending === item.ip ? <RefreshCw size={12} className="spin" /> : null}
+                    {pending === item.ip ? 'Unblocking' : 'Unblock'}
+                  </button>
                 </div>
-                <button onClick={() => onUnblock(item.ip)} style={{ padding: '4px 12px', background: 'transparent', border: '1px solid var(--border-bright)', color: 'var(--text-muted)', cursor: 'pointer', fontSize: 10, fontFamily: 'var(--font-mono)', marginLeft: 8 }}>UNBLOCK</button>
-              </div>
-            )
-          })
+              )
+            })}
+          </div>
         )}
       </div>
-      <div style={{ borderTop: '2px solid var(--border)', flex: 1, display: 'flex', flexDirection: 'column' }}>
-        <div style={{ padding: '8px 16px', background: 'rgba(168,85,247,0.08)', display: 'flex', alignItems: 'center', gap: 8, borderBottom: '1px solid var(--border)' }}>
-          <History size={12} color="#a855f7" />
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: '#a855f7', fontWeight: 'bold', letterSpacing: 1 }}>REMEDIATION HISTORY</span>
-          <span style={{ marginLeft: 'auto', fontSize: 9, color: 'var(--text-dim)' }}>{auditLogs.length} EVENTS</span>
+
+      <div className="card">
+        <div className="card-head">
+          <History size={15} color="var(--brand)" aria-hidden="true" />
+          <span className="card-title">Remediation history</span>
+          <span className="card-hint hide-sm">Every block and unblock, with who or what did it</span>
+          <div className="spacer" />
+          <span className="count">{auditLogs.length} events</span>
         </div>
-        <div style={{ flex: 1, overflowY: 'auto', fontFamily: 'var(--font-mono)', fontSize: 10 }}>
-          {auditLogs.length === 0 ? (
-            <div style={{ padding: '24px 16px', color: 'var(--text-dim)', fontStyle: 'italic', textAlign: 'center' }}>NO RECENT REMEDIATION ACTIONS.</div>
-          ) : (
-            auditLogs.map((entry, i) => (
-              <div key={i} style={{ padding: '6px 16px', borderBottom: '1px solid var(--bg-base)', display: 'flex', gap: 12 }}>
-                <span style={{ color: 'var(--text-dim)', flexShrink: 0, width: 100 }}>{formatTime(entry.timestamp)}</span>
-                <span style={{ color: '#a855f7', flexShrink: 0, width: 45 }}>[AUDIT]</span>
-                <span style={{ color: 'var(--text-primary)', flex: 1 }}>{entry.message}</span>
+        {auditLogs.length === 0 ? (
+          <EmptyState icon={<History size={22} />} title="No remediation actions yet"
+            body="Automatic blocks and manual unblocks are recorded here for audit." />
+        ) : (
+          <div className="logs short">
+            {auditLogs.map((e, i) => (
+              <div key={e.log_id || i} className="log is-audit">
+                <time>{formatTime(e.timestamp)}</time>
+                <span className="lvl lvl-audit">AUDIT</span>
+                <span className="ip" style={{ fontSize: 12.5 }}>{e.source_ip || '—'}</span>
+                <span className="msg">{e.message}</span>
               </div>
-            ))
-          )}
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Critical notification
+   ══════════════════════════════════════════════════════════════════════════ */
+
+function CriticalToast({ alert, total, onView, onDismiss }: {
+  alert: Alert, total: number, onView: () => void, onDismiss: () => void
+}) {
+  return (
+    <div className="toast" role="alert" aria-live="assertive">
+      <div className="toast-head">
+        <AlertTriangle size={16} strokeWidth={2.2} aria-hidden="true" />
+        Critical threat blocked
+        {total > 1 && <span className="count" style={{ color: 'inherit' }}>{total} total</span>}
+        <div className="spacer" />
+        <button className="btn ghost sm" onClick={onDismiss}
+          aria-label="Dismiss notification" title="Dismiss"
+          style={{ color: 'inherit', margin: '-3px -5px' }}>
+          <X size={14} />
+        </button>
+      </div>
+      <div className="toast-body">
+        <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3 }}>{alert.type}</div>
+        <IpCell ip={alert.source_ip} geoAnomaly={alert.geo_anomaly} />
+        <p style={{ fontSize: 12.5, color: 'var(--text-2)', marginTop: 9 }}>
+          Blocked automatically at the WAF. No action needed from you.
+        </p>
+        <div className="toast-actions">
+          <button className="btn primary" onClick={onView}>View report</button>
+          <button className="btn" onClick={onDismiss}>Dismiss</button>
         </div>
       </div>
     </div>
   )
 }
 
-function Panel({ title, icon, children, accent, extra }: { title: string, icon: React.ReactNode, children: React.ReactNode, accent?: string, extra?: React.ReactNode }) {
-  return (
-    <div className="glass-panel" style={{ background: 'var(--bg-panel)', border: `1px solid ${accent || 'var(--border)'}`, boxShadow: accent ? `0 0 20px ${accent}12` : 'none' }}>
-      <div style={{ padding: '10px 16px', borderBottom: `1px solid ${accent || 'var(--border)'}`, display: 'flex', alignItems: 'center', gap: 8, background: accent ? `${accent}08` : 'transparent' }}>
-        {icon}<span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, letterSpacing: 2, color: accent || 'var(--text-muted)' }}>{title}</span>
-        {extra && <div style={{ marginLeft: 'auto' }}>{extra}</div>}
-      </div>
-      <div>{children}</div>
-    </div>
-  )
-}
+/* ══════════════════════════════════════════════════════════════════════════
+   Dashboard
+   ══════════════════════════════════════════════════════════════════════════ */
 
 function Dashboard({ onLogout, theme, toggleTheme }: { onLogout: () => void, theme: Theme, toggleTheme: () => void }) {
-  const { data: alerts,    status: alertsStatus,  reset: resetAlerts  } = usePolling<Alert[]>(fetchAlerts,     [], { intervalMs: 4000 })
+  const { data: alerts, status: alertsStatus, reset: resetAlerts } = usePolling<Alert[]>(fetchAlerts, [], { intervalMs: 4000 })
   const { data: blockedIPs, status: blockedStatus, reset: resetBlocked } = usePolling<BlockedIP[]>(fetchBlockedIPs, [], { intervalMs: 4000 })
-  const { data: logs,      status: logsStatus,    reset: resetLogs    } = usePolling<LogEntry[]>(fetchLogs,       [], { intervalMs: 4000 })
+  const { data: logs, status: logsStatus, reset: resetLogs } = usePolling<LogEntry[]>(fetchLogs, [], { intervalMs: 4000 })
 
-  const connected  = alertsStatus === 'open' && logsStatus === 'open' && blockedStatus === 'open'
-  const anyError   = alertsStatus === 'error' || logsStatus === 'error' || blockedStatus === 'error'
-  const ipsError   = blockedStatus === 'error'
-  const logsError  = logsStatus === 'error'
+  const connected = alertsStatus === 'open' && logsStatus === 'open' && blockedStatus === 'open'
+  const anyError = alertsStatus === 'error' || logsStatus === 'error' || blockedStatus === 'error'
+  const ipsError = blockedStatus === 'error'
+  const logsError = logsStatus === 'error'
 
-  const [tab, setTab]                     = useState<'overview' | 'logs' | 'blocklist'>('overview')
+  const [tab, setTab] = useState<'overview' | 'logs' | 'blocklist'>('overview')
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null)
 
-  const handleUnblock = async (ip: string) => { await unblockIP(ip) }
+  const handleUnblock = async (ip: string) => { await unblockIP(ip); resetBlocked() }
   const criticalAlerts = (alerts as Alert[]).filter(a => a.severity === 'CRITICAL')
 
+  // Dismissal hides the NOTIFICATION only — never the alert itself. The alert
+  // stays in the log and the IP stays blocked. Tracked per alert_id so a NEW
+  // critical still surfaces, and held in component state (not persisted) so a
+  // reload re-surfaces anything still outstanding. Silencing a critical
+  // security alert permanently with one click would be an anti-pattern.
+  const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set())
+  const activeCritical = criticalAlerts.find(a => !dismissedIds.has(a.alert_id))
+  const dismissCritical = useCallback((id: string) => {
+    setDismissedIds(prev => { const next = new Set(prev); next.add(id); return next })
+  }, [])
+
+  const TABS = [
+    { id: 'overview' as const, label: 'Overview', icon: Activity },
+    { id: 'logs' as const, label: 'Log stream', icon: Terminal },
+    { id: 'blocklist' as const, label: 'Blocked IPs', icon: Ban, badge: (blockedIPs as BlockedIP[]).length },
+  ]
+
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {selectedAlert && <RiskCard alert={selectedAlert} onClose={() => setSelectedAlert(null)} />}
+    <>
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="mark"><Shield size={15} strokeWidth={2.2} aria-hidden="true" /></div>
+          <div className="wordmark">ACS Sentinel</div>
+          <div className="spacer" />
 
-      <div className="glass-panel" style={{ height: 48, background: 'var(--bg-panel)', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', padding: '0 20px', gap: 16, flexShrink: 0 }}>
-        <Shield size={16} color="var(--accent-green)" />
-        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: 'var(--accent-green)', letterSpacing: 3 }}>ACS SENTINEL</span>
-        <div style={{ flex: 1 }} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <Sun size={11} color="var(--accent-amber)" />
-          <button className="theme-toggle" onClick={toggleTheme} title="Toggle theme" />
-          <Moon size={11} color="var(--text-muted)" />
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          {connected ? <Wifi size={12} color="var(--accent-green)" /> : anyError ? <WifiOff size={12} color="var(--accent-red)" /> : <RefreshCw size={12} color="var(--accent-amber)" style={{ animation: 'spin 1s linear infinite' }} />}
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: connected ? 'var(--accent-green)' : anyError ? 'var(--accent-red)' : 'var(--accent-amber)' }}>
-            {connected ? 'STREAMING' : anyError ? 'RECONNECTING' : 'CONNECTING'}
-          </span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-green)', animation: 'pulse-green 2s infinite' }} />
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-muted)' }}>LIVE</span>
-        </div>
-        <button onClick={onLogout} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}><LogOut size={16} /></button>
-      </div>
+          {criticalAlerts.length > 0 && dismissedIds.size > 0 && (
+            <button className="btn sm ghost" onClick={() => setDismissedIds(new Set())}
+              title={`Show ${criticalAlerts.length} critical ${plural(criticalAlerts.length, 'alert', 'alerts')}`}
+              style={{ color: 'var(--sev-critical-fg)' }}>
+              <Bell size={14} />{criticalAlerts.length}
+            </button>
+          )}
 
-      {criticalAlerts.length > 0 && (
-        <div style={{ background: 'rgba(220,38,38,0.12)', borderBottom: '1px solid var(--accent-red)', padding: '8px 20px', display: 'flex', alignItems: 'center', gap: 8, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent-red)', cursor: 'pointer' }} onClick={() => setSelectedAlert(criticalAlerts[0])}>
-          <Bell size={12} />CRITICAL THREAT DETECTED — {criticalAlerts[0].type} from {criticalAlerts[0].source_ip}
-          <span style={{ marginLeft: 'auto', fontSize: 9 }}>VIEW REPORT</span>
-        </div>
-      )}
+          <div className={`chip hide-sm ${connected ? 'is-live' : anyError ? 'is-error' : 'is-wait'}`}>
+            <span className="dot" />
+            {connected ? <><Wifi size={13} aria-hidden="true" />Live</>
+              : anyError ? <><WifiOff size={13} aria-hidden="true" />Reconnecting</>
+                : <><RefreshCw size={13} className="spin" aria-hidden="true" />Connecting</>}
+          </div>
 
-      <div className="glass-panel" style={{ display: 'flex', padding: '0 20px', background: 'var(--bg-panel)', borderBottom: '1px solid var(--border)' }}>
-        {([{ id: 'overview', label: 'OVERVIEW', icon: <Activity size={12} /> }, { id: 'logs', label: 'LOG STREAM', icon: <Terminal size={12} /> }, { id: 'blocklist', label: 'BLOCKLIST', icon: <Ban size={12} /> }] as const).map(t => (
-          <button key={t.id} onClick={() => setTab(t.id)} style={{ padding: '10px 20px', background: 'transparent', border: 'none', borderBottom: tab === t.id ? '2px solid var(--accent-green)' : '2px solid transparent', color: tab === t.id ? 'var(--accent-green)' : 'var(--text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 6, fontFamily: 'var(--font-mono)', fontSize: 11, letterSpacing: 1 }}>
-            {t.icon} {t.label}
+          <ThemeButton theme={theme} toggleTheme={toggleTheme} />
+          <button className="btn ghost" onClick={onLogout} title="Sign out" aria-label="Sign out">
+            <LogOut size={16} />
           </button>
-        ))}
-      </div>
+        </div>
+      </header>
 
-      <div style={{ flex: 1, padding: 20, overflow: 'auto', background: 'var(--bg-base)' }}>
+      <div className="app">
+        <StatusBand alerts={alerts as Alert[]} blockedIPs={blockedIPs as BlockedIP[]}
+          logs={logs as LogEntry[]} anyError={anyError} connected={connected} />
+
+        <SeverityLedger alerts={alerts as Alert[]} />
+
+        <div className="tabs" role="tablist" aria-label="Dashboard sections">
+          {TABS.map(t => (
+            <button key={t.id} className="tab" role="tab" aria-selected={tab === t.id}
+              onClick={() => setTab(t.id)}>
+              <t.icon size={15} aria-hidden="true" />
+              {t.label}
+              {!!t.badge && t.badge > 0 && <span className="badge">{t.badge}</span>}
+            </button>
+          ))}
+        </div>
+
         {tab === 'overview' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-            <AlertBanner alerts={alerts as Alert[]} />
-            <Panel title="SECURITY METRICS HUB (MYT)" icon={<Activity size={12} color="var(--accent-blue)" />} accent="var(--accent-blue)">
-              <div style={{ padding: '16px 8px', display: 'flex', gap: 16 }}>
-                <div style={{ flex: 1 }}><AnomalyChart alerts={alerts as Alert[]} /></div>
-                <div style={{ width: 140, borderLeft: '1px solid var(--border)', paddingLeft: 16, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <RiskGauge logs={logs as LogEntry[]} />
-                </div>
+          <div className="stack">
+            <div className="card">
+              <div className="card-head">
+                <span className="card-title">Anomaly score over time</span>
+                <span className="card-hint hide-sm">Last {Math.min(40, (alerts as Alert[]).length)} detections · Malaysia time</span>
+                <div className="spacer" />
+                <button className="btn sm ghost" onClick={resetAlerts} title="Refresh now">
+                  <RefreshCw size={13} />Refresh
+                </button>
               </div>
-            </Panel>
-            <Panel title="RECENT ALERTS" icon={<Bell size={12} color="var(--accent-amber)" />} accent="var(--accent-amber)"
-              extra={<span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--text-dim)' }}>CLICK FOR RISK CARD</span>}>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
-                {(alerts as Alert[]).length === 0 ? (
-                  <div style={{ padding: 16, color: 'var(--text-dim)' }}>NO ALERTS — SYSTEM NOMINAL</div>
-                ) : (
-                  [...(alerts as Alert[])].sort((a, b) => b.timestamp.localeCompare(a.timestamp)).slice(0, 15).map((alert, i) => {
-                    const isML      = alert.method === 'isolation_forest'
-                    const methColor = isML ? '#a855f7' : 'var(--text-muted)'
-                    return (
-                      <div key={i} onClick={() => setSelectedAlert(alert)} style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '10px 16px', borderBottom: '1px solid var(--border)', cursor: 'pointer' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                          <SeverityBadge severity={alert.severity} />
-                          <IPWithGeo ip={alert.source_ip} geoAnomaly={alert.geo_anomaly} />
-                          <span style={{ color: 'var(--text-primary)', flex: 1, fontWeight: 'bold' }}>{alert.type}</span>
-                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: methColor, border: `1px solid ${methColor}66`, padding: '2px 6px', background: `${methColor}15` }}>[{isML ? 'ML' : 'RULE'}]</span>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 4, color: 'var(--text-dim)', fontSize: 10 }}><Info size={10} />score: {alert.score.toFixed(3)}</div>
-                          <span style={{ color: 'var(--text-dim)', fontSize: 10 }}>{formatTime(alert.timestamp)}</span>
-                        </div>
-                        <div style={{ paddingLeft: 60, fontSize: 10, color: 'var(--text-dim)' }}>{alert.reason}</div>
-                      </div>
-                    )
-                  })
-                )}
+              <AnomalyChart alerts={alerts as Alert[]} onRunSim={resetAlerts} />
+            </div>
+
+            <div className="card">
+              <div className="card-head">
+                <span className="card-title">Recent alerts</span>
+                <span className="card-hint">Select a row for the full report</span>
               </div>
-            </Panel>
+              <AlertList alerts={alerts as Alert[]} loading={alertsStatus === 'connecting'} onSelect={setSelectedAlert} />
+            </div>
           </div>
         )}
 
         {tab === 'logs' && (
-          <Panel title="LIVE LOG STREAM" icon={<Terminal size={12} color="var(--accent-green)" />} accent="var(--accent-green)"
-            extra={<button onClick={resetLogs} style={{ padding: '2px 8px', background: 'transparent', border: '1px solid var(--border)', color: 'var(--text-dim)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)' }}>RECONNECT</button>}>
-            <LogFeed logs={logs as LogEntry[]} loading={logsStatus === 'connecting'} error={logsError} onRefresh={resetLogs} />
-          </Panel>
+          <LogFeed logs={logs as LogEntry[]} loading={logsStatus === 'connecting'} error={logsError} onRefresh={resetLogs} />
         )}
 
         {tab === 'blocklist' && (
-          <Panel title="BLOCKED IP ADDRESSES" icon={<Ban size={12} color="var(--accent-red)" />} accent="var(--accent-red)"
-            extra={<button onClick={resetBlocked} style={{ padding: '2px 8px', background: 'transparent', border: '1px solid var(--border)', color: 'var(--text-dim)', cursor: 'pointer', fontSize: 9, fontFamily: 'var(--font-mono)' }}>RECONNECT</button>}>
-            <BlocklistPanel ips={blockedIPs as BlockedIP[]} logs={logs as LogEntry[]} loading={blockedStatus === 'connecting'} error={ipsError} onUnblock={handleUnblock} onRefresh={resetBlocked} />
-          </Panel>
+          <BlocklistPanel ips={blockedIPs as BlockedIP[]} logs={logs as LogEntry[]}
+            loading={blockedStatus === 'connecting'} error={ipsError}
+            onUnblock={handleUnblock} onRefresh={resetBlocked} />
         )}
+
+        <footer className="foot">
+          <ShieldCheck size={13} color="var(--ok)" aria-hidden="true" />
+          Automatic blocking is on
+          <div className="spacer" />
+          <span className="mono">MYT (UTC+8)</span>
+        </footer>
       </div>
 
-      <div style={{ height: 24, background: 'var(--bg-panel)', borderTop: '1px solid var(--border)', display: 'flex', alignItems: 'center', padding: '0 16px', gap: 20, fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--text-dim)' }}>
-        <Shield size={10} color="var(--accent-green)" /><span>AUTO-MITIGATION ACTIVE</span>
-        <span style={{ flex: 1 }} /><span>ACS Sentinel · MYT (UTC+8)</span>
-      </div>
-    </div>
+      {activeCritical && (
+        <CriticalToast alert={activeCritical} total={criticalAlerts.length}
+          onView={() => { setSelectedAlert(activeCritical); dismissCritical(activeCritical.alert_id) }}
+          onDismiss={() => dismissCritical(activeCritical.alert_id)} />
+      )}
+
+      {selectedAlert && (
+        <ThreatReport alert={selectedAlert} onClose={() => setSelectedAlert(null)} onUnblock={handleUnblock} />
+      )}
+    </>
   )
 }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Root
+   ══════════════════════════════════════════════════════════════════════════ */
 
 export default function App() {
   const [authenticated, setAuthenticated] = useState(false)
@@ -508,7 +905,8 @@ export default function App() {
     try { return (localStorage.getItem('acs-theme') as Theme) || 'dark' } catch { return 'dark' }
   })
   useEffect(() => { applyTheme(theme); try { localStorage.setItem('acs-theme', theme) } catch { } }, [theme])
-  const toggleTheme = useCallback(() => setTheme(t => t === 'dark' ? 'light' : 'dark'), [])
+  const toggleTheme = useCallback(() => setTheme(t => (t === 'dark' ? 'light' : 'dark')), [])
+
   if (!authenticated) return <LoginScreen onLogin={() => setAuthenticated(true)} theme={theme} toggleTheme={toggleTheme} />
   return <Dashboard onLogout={() => { signOut(); setAuthenticated(false) }} theme={theme} toggleTheme={toggleTheme} />
 }

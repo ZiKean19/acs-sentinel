@@ -63,15 +63,29 @@ VALID_PASS = "portal2026"
 # Detection Lambda + region, used by the `low` scenario's direct-invoke path.
 DETECTION_LAMBDA = "acs-detection-lambda"
 AWS_REGION       = "ap-southeast-1"
-# A Malaysian IP prefix so the geo lookup resolves to MY (geo_anomaly=0),
-# which is required for a LOW severity result (foreign IPs get bumped up).
-MALAYSIAN_IP     = "175.136.1.100"
+
+# Distinct source IPs per scenario, injected via X-Forwarded-For so each
+# scenario gets its OWN detection window (no cross-contamination). This lets
+# every severity tier be demonstrated simultaneously on the dashboard.
+SCENARIO_IPS = {
+    "low":        "175.136.50.10",    # Malaysian, mild anomaly    -> LOW (ML)
+    "medium":     "175.136.55.15",    # Malaysian, moderate anomaly-> MEDIUM (ML)
+    "stealth":    "203.0.113.45",     # Foreign, low-and-slow      -> HIGH (ML + geo)
+    "scan":       "45.33.32.156",     # Foreign, path scanning     -> HIGH (rule, 404s)
+    "bruteforce": "198.51.100.77",    # Foreign, high failure rate -> HIGH (rule)
+    "flood":      "192.0.2.88",       # Foreign, high volume       -> CRITICAL (rule)
+    "normal":     "175.136.60.20",    # Malaysian, benign          -> no alert
+}
+# A Malaysian IP used by the low scenario's direct Lambda invoke.
+MALAYSIAN_IP     = SCENARIO_IPS["low"]
 
 
-def _post_login(base_url: str, username: str, password: str, timeout: float = 5.0) -> int:
+def _post_login(base_url: str, username: str, password: str, xff: str = None, timeout: float = 5.0) -> int:
     """Send one POST /login, return the HTTP status code (or 0 on error)."""
     data = urllib.parse.urlencode({"username": username, "password": password}).encode()
     req = urllib.request.Request(f"{base_url}/login", data=data, method="POST")
+    if xff:
+        req.add_header("X-Forwarded-For", xff)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status
@@ -81,8 +95,10 @@ def _post_login(base_url: str, username: str, password: str, timeout: float = 5.
         return 0
 
 
-def _get_page(base_url: str, timeout: float = 5.0) -> int:
+def _get_page(base_url: str, xff: str = None, timeout: float = 5.0) -> int:
     req = urllib.request.Request(f"{base_url}/", method="GET")
+    if xff:
+        req.add_header("X-Forwarded-For", xff)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status
@@ -101,20 +117,22 @@ def _summarise(codes: list):
         print("   >> 403 seen: WAF is actively blocking this IP.")
 
 
-def attack_bruteforce(base_url: str, n: int = 60):
-    """Many failed logins -> high failure rate -> rule engine -> HIGH/CRITICAL."""
-    print(f"[bruteforce] Sending {n} failed logins to {base_url}/login ...")
+def attack_bruteforce(base_url: str, n: int = 55):
+    """Many failed logins -> high failure rate -> rule engine -> HIGH."""
+    xff = SCENARIO_IPS["bruteforce"]
+    print(f"[bruteforce] Sending {n} failed logins from {xff} ...")
     with ThreadPoolExecutor(max_workers=20) as pool:
-        futures = [pool.submit(_post_login, base_url, "admin", f"wrong{i}") for i in range(n)]
+        futures = [pool.submit(_post_login, base_url, "admin", f"wrong{i}", xff) for i in range(n)]
         codes = [f.result() for f in futures]
     _summarise(codes)
 
 
 def attack_flood(base_url: str, n: int = 350):
     """High request volume -> DDoS rule -> CRITICAL."""
-    print(f"[flood] Sending {n} rapid requests to {base_url}/ ...")
+    xff = SCENARIO_IPS["flood"]
+    print(f"[flood] Sending {n} rapid requests from {xff} ...")
     with ThreadPoolExecutor(max_workers=50) as pool:
-        futures = [pool.submit(_get_page, base_url) for _ in range(n)]
+        futures = [pool.submit(_get_page, base_url, xff) for _ in range(n)]
         codes = [f.result() for f in futures]
     _summarise(codes)
 
@@ -126,28 +144,30 @@ def attack_stealth(base_url: str, total: int = 40, fail_ratio: float = 0.35):
     """
     n_fail = int(total * fail_ratio)
     n_ok = total - n_fail
-    print(f"[stealth] Sending {total} mixed requests "
+    xff = SCENARIO_IPS["stealth"]
+    print(f"[stealth] Sending {total} mixed requests from {xff} "
           f"({n_ok} valid, {n_fail} failed, ~{int(fail_ratio*100)}% failure) ...")
-    print("   (stays under rule thresholds -> should be caught by ML, not rules)")
+    print("   (stays under rule thresholds -> caught by ML/Isolation Forest, NOT rules)")
     codes = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = []
         for _ in range(n_ok):
-            futures.append(pool.submit(_post_login, base_url, VALID_USER, VALID_PASS))
+            futures.append(pool.submit(_post_login, base_url, VALID_USER, VALID_PASS, xff))
         for i in range(n_fail):
-            futures.append(pool.submit(_post_login, base_url, "admin", f"wrong{i}"))
+            futures.append(pool.submit(_post_login, base_url, "admin", f"wrong{i}", xff))
         codes = [f.result() for f in futures]
     _summarise(codes)
 
 
 def attack_normal(base_url: str, n: int = 8):
     """Benign traffic — control test. Should NOT trigger detection."""
-    print(f"[normal] Sending {n} benign page views + a valid login ...")
+    xff = SCENARIO_IPS["normal"]
+    print(f"[normal] Sending {n} benign page views + a valid login from {xff} ...")
     codes = []
     for _ in range(n):
-        codes.append(_get_page(base_url))
+        codes.append(_get_page(base_url, xff))
         time.sleep(0.5)
-    codes.append(_post_login(base_url, VALID_USER, VALID_PASS))
+    codes.append(_post_login(base_url, VALID_USER, VALID_PASS, xff))
     _summarise(codes)
 
 
@@ -234,17 +254,20 @@ def attack_low(base_url: str = None):
     print("[low] Direct-invoking Detection Lambda with a Malaysian IP + mild anomaly ...")
     print("      (LOW requires domestic traffic; real attacks from here look foreign)")
 
-    # Build several mildly-anomalous events from the same Malaysian IP so the
-    # sliding window accumulates a small-but-unusual pattern (a few failures,
-    # modest volume) — enough for the Isolation Forest to flag as LOW.
+    # Build mildly-anomalous events. 10 requests with a single failure (~10%)
+    # places the aggregate solidly in the middle of the LOW band (score ~-0.067)
+    # rather than on the edge — so it reliably classifies as LOW rather than
+    # occasionally slipping into "normal". Failure is placed last so the running
+    # failure rate never approaches the rule threshold (>=0.5).
     log_events = []
-    for i in range(12):
-        status = 401 if i % 5 == 0 else 200  # ~20% failure — mild
+    for i in range(10):
+        # First 9 are successful page views; the last is a single failure.
+        status = 401 if i == 9 else 200
         log_events.append({
             "ip": MALAYSIAN_IP,
             "event_type": "LOGIN_FAIL" if status == 401 else "PAGE_VIEW",
             "status": status,
-            "path": "/login",
+            "path": "/login" if status == 401 else "/",
             "payload_size": 40 + i,
         })
 
@@ -285,11 +308,72 @@ def attack_low(base_url: str = None):
         print(f"   ERROR: {exc}")
 
 
+def attack_medium(base_url: str, total: int = 25, fail_ratio: float = 0.24):
+    """
+    MEDIUM severity via ML. A Malaysian IP (no geo bump) with moderate volume
+    and a moderate failure rate — more anomalous than LOW but still under the
+    rule thresholds, so the Isolation Forest classifies it as MEDIUM.
+    """
+    n_fail = max(1, int(total * fail_ratio))
+    n_ok = total - n_fail
+    xff = SCENARIO_IPS["medium"]
+    print(f"[medium] Sending {total} mixed requests from {xff} "
+          f"({n_ok} valid, {n_fail} failed, ~{int(fail_ratio*100)}% failure) ...")
+    print("   (moderate anomaly, under rule thresholds -> MEDIUM via Isolation Forest)")
+    codes = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = []
+        for _ in range(n_ok):
+            futures.append(pool.submit(_post_login, base_url, VALID_USER, VALID_PASS, xff))
+        for i in range(n_fail):
+            futures.append(pool.submit(_post_login, base_url, "admin", f"wrong{i}", xff))
+        codes = [f.result() for f in futures]
+    _summarise(codes)
+
+
+def _get_path(base_url: str, path: str, xff: str = None, timeout: float = 5.0) -> int:
+    req = urllib.request.Request(f"{base_url}{path}", method="GET")
+    if xff:
+        req.add_header("X-Forwarded-For", xff)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
+
+
+def attack_scan(base_url: str):
+    """
+    Path scanning / directory probing. Requests a list of common sensitive
+    paths that don't exist on the portal, generating a burst of 404s. The high
+    failed-status-rate trips the rule engine's "Scan Probe" detection — a
+    different attack profile from credential brute force (which hits /login).
+    """
+    xff = SCENARIO_IPS["scan"]
+    probe_paths = [
+        "/admin", "/administrator", "/wp-login.php", "/wp-admin", "/.env",
+        "/config.php", "/backup.sql", "/db.sql", "/phpmyadmin", "/.git/config",
+        "/api/v1/users", "/api/keys", "/server-status", "/.aws/credentials",
+        "/shell.php", "/cgi-bin/", "/vendor/", "/console", "/debug", "/setup",
+        "/old", "/test", "/backup.zip", "/dump.sql", "/.htpasswd",
+    ]
+    print(f"[scan] Probing {len(probe_paths)} sensitive paths from {xff} ...")
+    print("   (unknown paths -> 404s -> high failure rate -> Scan Probe rule)")
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [pool.submit(_get_path, base_url, p, xff) for p in probe_paths]
+        codes = [f.result() for f in futures]
+    _summarise(codes)
+
+
 SCENARIOS = {
     "bruteforce": attack_bruteforce,
     "stealth":    attack_stealth,
     "flood":      attack_flood,
     "low":        attack_low,
+    "medium":     attack_medium,
+    "scan":       attack_scan,
     "normal":     attack_normal,
 }
 
@@ -307,7 +391,7 @@ def main():
     print("=" * 64)
 
     if args.scenario == "all":
-        for name in ("normal", "low", "stealth", "bruteforce", "flood"):
+        for name in ("normal", "low", "medium", "stealth", "scan", "bruteforce", "flood"):
             SCENARIOS[name](args.url)
             print(f"   ...pausing 15s before next scenario...\n")
             time.sleep(15)

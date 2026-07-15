@@ -67,6 +67,10 @@ def _get_alerts():
         "score":       float(i.get("score", {}).get("N", 0)),
         "reason":      i.get("reason", {}).get("S", ""),
         "status":      i.get("status", {}).get("S", "OPEN"),
+        # `method` distinguishes ML detections from rule hits. It was omitted
+        # here, so the dashboard saw undefined and labelled every alert "Rule",
+        # rendering the Isolation Forest invisible in the UI.
+        "method":      i.get("method", {}).get("S", ""),
         "geo_anomaly": int(i.get("geo_anomaly", {}).get("N", 0)),
     } for i in items]
     return sorted(alerts, key=lambda x: x["timestamp"], reverse=True)

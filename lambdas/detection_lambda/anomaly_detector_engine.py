@@ -72,26 +72,46 @@ def rule_based_check(features: dict) -> dict | None:
     return None
 
 
+def _featurize(total_requests, failed_status_rate, payload_size_variance) -> list:
+    """
+    Build the model's feature vector.
+
+    payload_size_variance spans ~0 to 1e11, while total_requests spans ~1-500
+    and failed_status_rate spans 0-1. Left raw, the variance term dominates the
+    scaled space and washes out the other two signals, so the model effectively
+    only "sees" payload variance and treats moderate volume/failure anomalies as
+    normal. A log1p transform compresses the variance range to a comparable
+    scale, letting all three features contribute to the isolation score.
+    """
+    return [float(total_requests), float(failed_status_rate), float(np.log1p(payload_size_variance))]
+
+
 def _generate_normal_samples(n: int = 2000) -> np.ndarray:
     rng = np.random.default_rng(42)
-    return np.column_stack([
-        rng.integers(1, 15, n),
-        rng.uniform(0.0, 0.05, n),
-        rng.uniform(0, 100_000, n),
-    ]).astype(np.float64)
+    return np.array([
+        _featurize(r, f, p) for r, f, p in zip(
+            rng.integers(1, 12, n),
+            rng.uniform(0.0, 0.08, n),
+            rng.uniform(0, 50_000, n),
+        )
+    ], dtype=np.float64)
 
 
-def _generate_attack_samples(n: int = 200) -> np.ndarray:
+def _generate_attack_samples(n: int = 400) -> np.ndarray:
     rng     = np.random.default_rng(99)
     samples = []
     for _ in range(n):
-        attack_type = rng.integers(0, 3)
-        if attack_type == 0:
-            samples.append([rng.integers(100, 500), rng.uniform(0.0, 0.1), rng.uniform(0, 200_000)])
-        elif attack_type == 1:
-            samples.append([rng.integers(20, 100),  rng.uniform(0.5, 1.0), rng.uniform(0, 100_000)])
-        else:
-            samples.append([rng.integers(5, 50),    rng.uniform(0.0, 0.2), rng.uniform(1e9, 1e11)])
+        attack_type = rng.integers(0, 4)
+        if attack_type == 0:      # high-volume flood
+            samples.append(_featurize(rng.integers(80, 500), rng.uniform(0.0, 0.15), rng.uniform(0, 200_000)))
+        elif attack_type == 1:    # high failure rate (brute force / scanning)
+            samples.append(_featurize(rng.integers(15, 100), rng.uniform(0.4, 1.0), rng.uniform(0, 80_000)))
+        elif attack_type == 2:    # payload-size anomaly
+            samples.append(_featurize(rng.integers(5, 50), rng.uniform(0.0, 0.3), rng.uniform(5e8, 1e11)))
+        else:                     # moderate / low-and-slow anomaly — the class the
+                                  # rule engine cannot catch, and the one the ML
+                                  # exists to detect
+            samples.append(_featurize(rng.integers(18, 60), rng.uniform(0.12, 0.4), rng.uniform(0, 100_000)))
     return np.array(samples, dtype=np.float64)
 
 
@@ -114,10 +134,10 @@ class AnomalyDetectorEngine:
         from sklearn.ensemble import IsolationForest
         from sklearn.preprocessing import StandardScaler
 
-        X = np.vstack([_generate_normal_samples(2000), _generate_attack_samples(200)])
+        X = np.vstack([_generate_normal_samples(2000), _generate_attack_samples(400)])
         self.scaler = StandardScaler()
         X_scaled    = self.scaler.fit_transform(X)
-        self.model  = IsolationForest(n_estimators=300, max_samples="auto", contamination=0.03, random_state=42)
+        self.model  = IsolationForest(n_estimators=300, max_samples="auto", contamination=0.10, random_state=42)
         self.model.fit(X_scaled)
 
         with open(MODEL_PATH, "wb") as f:
@@ -144,7 +164,12 @@ class AnomalyDetectorEngine:
             if rule_result:
                 return rule_result
 
-        vec        = np.array([[features.get(col, 0) for col in FEATURE_COLS]], dtype=np.float64)
+        # Must use the SAME featurisation as training (log1p on payload variance).
+        vec        = np.array([_featurize(
+            features.get("total_requests", 0),
+            features.get("failed_status_rate", 0),
+            features.get("payload_size_variance", 0),
+        )], dtype=np.float64)
         vec_scaled = self.scaler.transform(vec)
         score      = float(self.model.decision_function(vec_scaled)[0])
         is_anomaly = score < IF_THRESHOLD
@@ -155,13 +180,16 @@ class AnomalyDetectorEngine:
         # nudges the two lowest bands up one level, reflecting the SME threat
         # model where foreign traffic is somewhat more suspicious — without
         # collapsing every foreign hit into CRITICAL.
+        # Bands are calibrated to the retrained model's score distribution:
+        # benign traffic sits just above 0, and the score falls as the traffic
+        # becomes more isolated (anomalous).
         severity = "NONE"
         if is_anomaly:
-            if score < -0.28:
+            if score < -0.085:
                 severity = "CRITICAL"
-            elif score < -0.18:
+            elif score < -0.065:
                 severity = "HIGH"
-            elif score < -0.08:
+            elif score < -0.040:
                 severity = "MEDIUM"
             else:
                 severity = "LOW"
