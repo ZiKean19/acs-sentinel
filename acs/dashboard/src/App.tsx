@@ -69,8 +69,11 @@ function SeverityPill({ severity }: { severity: string }) {
   )
 }
 
-function IpCell({ ip, geoAnomaly }: { ip: string, geoAnomaly?: boolean | string }) {
-  const foreign = geoAnomaly === true || geoAnomaly === 'true'
+function IpCell({ ip, geoAnomaly }: { ip: string, geoAnomaly?: boolean | string | number }) {
+  // The API returns geo_anomaly as 0/1 (DynamoDB numeric). Comparing a number
+  // against `true`/`'true'` is always false, so every IP rendered as Malaysian.
+  // Coerce instead of strict-comparing, and accept all three shapes.
+  const foreign = Number(geoAnomaly) === 1 || geoAnomaly === true || geoAnomaly === 'true'
   return (
     <span className="ip" title={foreign ? `${ip} — originates outside Malaysia` : `${ip} — Malaysian address`}>
       <span className="flagmark" aria-hidden="true">{foreign ? '🌐' : '🇲🇾'}</span>
@@ -452,7 +455,7 @@ function ThreatReport({ alert, onClose, onUnblock }: {
   alert: Alert, onClose: () => void, onUnblock: (ip: string) => void
 }) {
   const closeRef = useRef<HTMLButtonElement>(null)
-  const foreign = alert.geo_anomaly === true || (alert.geo_anomaly as any) === 'true'
+  const foreign = Number(alert.geo_anomaly) === 1 || (alert.geo_anomaly as any) === true || (alert.geo_anomaly as any) === 'true'
   const isML = (alert.method || '').toUpperCase().includes('ML') || (alert.method || '').toLowerCase().includes('isolation')
 
   useEffect(() => {
