@@ -60,7 +60,29 @@ async function get<T>(path: string): Promise<T> {
 
 export const fetchAlerts     = () => get<Alert[]>('/alerts')
 export const fetchBlockedIPs = () => get<BlockedIP[]>('/blocked-ips')
-export const fetchLogs       = () => get<LogEntry[]>('/logs')
+
+/** One page of the log stream. `cursor` continues backwards in time;
+ *  null cursor in the response means the database is exhausted. */
+export interface LogPage {
+  items:    LogEntry[]
+  cursor:   string | null
+  scanned?: number
+}
+
+export async function fetchLogPage(opts: { cursor?: string | null, q?: string, limit?: number } = {}): Promise<LogPage> {
+  const p = new URLSearchParams()
+  if (opts.cursor) p.set('cursor', opts.cursor)
+  if (opts.q) p.set('q', opts.q)
+  if (opts.limit) p.set('limit', String(opts.limit))
+  const qs = p.toString()
+  const raw = await get<LogPage | LogEntry[]>(`/logs${qs ? `?${qs}` : ''}`)
+  // Tolerate the pre-pagination Lambda, which returned a bare array. The
+  // dashboard then simply has no "older" pages until the API is redeployed.
+  return Array.isArray(raw) ? { items: raw, cursor: null } : raw
+}
+
+/** Newest slice for the 4-second poll — same shape the poller always used. */
+export const fetchLogs = async (): Promise<LogEntry[]> => (await fetchLogPage({ limit: 300 })).items
 
 export async function unblockIP(ip: string): Promise<void> {
   const headers = await authHeaders()

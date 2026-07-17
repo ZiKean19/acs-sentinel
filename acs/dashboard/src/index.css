@@ -31,6 +31,8 @@
   --sev-medium-bg:rgba(255,209,102,.13);   --sev-low-bg:rgba(93,218,160,.13);
   --sev-critical-fg:#ff8b96; --sev-high-fg:#ffb37b; --sev-medium-fg:#ffdc8c; --sev-low-fg:#79e3b3;
 
+  --sev-unknown:#8593a5;
+
   --ok:#5ddaa0;
   --shadow:0 1px 0 rgba(255,255,255,.03), 0 10px 30px -12px rgba(0,0,0,.7);
   --chart-grid:#232b35; --chart-tick:#8593a5;
@@ -41,7 +43,9 @@
 [data-theme="light"] {
   --canvas:#eef1f5; --panel:#ffffff; --raised:#f6f8fa; --sunken:#f0f3f7;
   --line:#e0e6ed;   --line-2:#c8d2de;
-  --text:#0f1720;   --text-2:#546072;  --text-3:#6b7788;
+  /* text-3 at #6b7788 measured 4.49:1 on white — a hair under the 4.5:1 AA
+     line for the 12px labels it carries. Darkened one step for margin. */
+  --text:#0f1720;   --text-2:#546072;  --text-3:#5f6b7d;
 
   --brand:#0a63c9;  --brand-soft:rgba(10,99,201,.08);
   --brand-ink:#ffffff;
@@ -54,9 +58,11 @@
   --sev-critical-bg:#fde5e7; --sev-high-bg:#fdedd8; --sev-medium-bg:#fbf2d2; --sev-low-bg:#d9f4e7;
   --sev-critical-fg:#8f1220; --sev-high-fg:#8a3c0a; --sev-medium-fg:#6f4d05; --sev-low-fg:#0a5238;
 
+  --sev-unknown:#5f6b7d;
+
   --ok:#0d7a52;
   --shadow:0 1px 2px rgba(15,23,32,.06), 0 6px 20px -10px rgba(15,23,32,.18);
-  --chart-grid:#e6ebf1; --chart-tick:#6b7788;
+  --chart-grid:#e6ebf1; --chart-tick:#5f6b7d;
   --chart-tooltip-bg:#ffffff; --chart-tooltip-border:#e0e6ed;
   --focus:#0a63c9;
 }
@@ -159,14 +165,16 @@ body {
 
 /* ── status band ──────────────────────────────────────────────────────── */
 .status {
-  display:flex; align-items:stretch;
-  margin:20px 0 14px; border-radius:12px; overflow:hidden;
+  display:flex; align-items:flex-start; gap:12px;
+  margin:16px 0 14px; padding:13px 16px 13px 0; border-radius:12px; overflow:hidden;
   background:var(--panel); border:1px solid var(--line); box-shadow:var(--shadow);
 }
-.status .spine { width:5px; flex-shrink:0; background:var(--ok) }
+.status .spine { width:4px; align-self:stretch; flex-shrink:0; background:var(--ok); margin:-13px 0 }
 .status.tone-active   .spine { background:var(--sev-high) }
 .status.tone-critical .spine { background:var(--sev-critical) }
-.status .body { flex:1; padding:20px 24px; min-width:0 }
+.status .body { flex:1; min-width:0 }
+/* Dot sits on the verdict's centre line (16px × 1.35 ≈ 22px tall). */
+.status .live-dot { margin-top:7px }
 
 .eyebrow {
   font:500 11.5px/1 'IBM Plex Mono', monospace;
@@ -174,42 +182,39 @@ body {
   color:var(--text-3); margin-bottom:9px;
 }
 .verdict {
-  font-family:'IBM Plex Sans Condensed', 'IBM Plex Sans', sans-serif;
-  font-weight:600; font-size:29px; line-height:1.18; letter-spacing:-.015em;
-  color:var(--text); max-width:28ch;
+  font-weight:600; font-size:16px; line-height:1.35; letter-spacing:-.01em;
+  color:var(--text);
 }
 .verdict em { font-style:normal; color:var(--ok) }
 .status.tone-active   .verdict em { color:var(--sev-high-fg) }
 .status.tone-critical .verdict em { color:var(--sev-critical-fg) }
-.subline { margin-top:8px; font-size:13.5px; color:var(--text-2); max-width:62ch }
+.subline {
+  margin-top:2px; font-size:12.5px; color:var(--text-2); max-width:78ch;
+  font-variant-numeric:tabular-nums;
+}
 
-/* ── risk meter ───────────────────────────────────────────────────────── */
-.meter {
-  width:290px; flex-shrink:0; padding:20px 24px;
-  border-left:1px solid var(--line); background:var(--raised);
-  display:flex; flex-direction:column; justify-content:center;
+/* ── live status dot ──────────────────────────────────────────────────── */
+/* The all-clear carries a heartbeat instead of a static sentence. Only the
+   healthy state pulses — watch/act/idle hold still, so motion always means
+   "alive and fine", never "look at me". */
+.live-dot {
+  --dotc:var(--ok);
+  flex:none; width:8px; height:8px; border-radius:50%;
+  background:var(--dotc); position:relative;
 }
-.meter-head { display:flex; align-items:baseline; justify-content:space-between; margin-bottom:12px }
-.meter-band { font-weight:600; font-size:15px; color:var(--ok) }
-.meter-band.b-watch { color:var(--sev-medium-fg) }
-.meter-band.b-act   { color:var(--sev-critical-fg) }
-.meter-score { font:500 12px/1 'IBM Plex Mono', monospace; color:var(--text-3) }
-.meter-track { position:relative; height:8px; border-radius:4px; overflow:hidden; display:flex }
-.meter-track i { flex:1; display:block; opacity:.5 }
-.meter-track i:nth-child(1) { background:var(--sev-low) }
-.meter-track i:nth-child(2) { background:var(--sev-medium) }
-.meter-track i:nth-child(3) { background:var(--sev-critical) }
-.meter-needle {
-  position:absolute; top:-4px; width:3px; height:16px; border-radius:2px;
-  background:var(--text); box-shadow:0 0 0 2px var(--raised);
-  transform:translateX(-1.5px);
-  transition:left .5s cubic-bezier(.2,.7,.3,1);
+.live-dot::after {
+  content:""; position:absolute; inset:-5px; border-radius:50%;
+  border:2px solid var(--dotc); opacity:0;
+  animation:sentinel-pulse 2.2s ease-out infinite;
 }
-.meter-scale { display:flex; margin-top:8px; font-size:11.5px; color:var(--text-3) }
-.meter-scale span { flex:1 }
-.meter-scale span:nth-child(2) { text-align:center }
-.meter-scale span:nth-child(3) { text-align:right }
-.meter-note { margin-top:11px; font-size:12.5px; color:var(--text-2) }
+.live-dot.b-watch { --dotc:var(--sev-medium) }
+.live-dot.b-act   { --dotc:var(--sev-critical) }
+.live-dot.idle    { --dotc:var(--text-3) }
+.live-dot.b-watch::after, .live-dot.b-act::after, .live-dot.idle::after { animation:none }
+@keyframes sentinel-pulse {
+  0%        { transform:scale(.55); opacity:.7 }
+  70%, 100% { transform:scale(1.45); opacity:0 }
+}
 
 /* ── severity ledger ──────────────────────────────────────────────────── */
 .ledger { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:18px }
@@ -374,12 +379,15 @@ body {
 .block-row.r-high::before     { background:var(--sev-high) }
 .block-row.r-medium::before   { background:var(--sev-medium) }
 .block-row.r-low::before      { background:var(--sev-low) }
+/* Malformed severity still gets a spine — a grey "unparsed" beats a gap that
+   reads as a rendering bug. Same token feeds the TTL fill on these rows. */
+.row.r-unknown::before, .block-row.r-unknown::before { background:var(--sev-unknown) }
 .block-reason { font-size:13px; color:var(--text-2) }
 .ttl { display:flex; flex-direction:column; gap:5px; width:112px; flex-shrink:0 }
 .ttl .t { font:500 12.5px/1 'IBM Plex Mono', monospace; color:var(--text-2) }
 .ttl .t.expired { color:var(--sev-medium-fg) }
-.ttl .track { height:3px; border-radius:2px; background:var(--line); overflow:hidden }
-.ttl .fill  { height:100%; background:var(--text-3); border-radius:2px; transition:width 1s linear }
+.ttl .track { display:block; height:5px; border-radius:3px; background:var(--line-2); overflow:hidden }
+.ttl .fill  { display:block; height:100%; background:var(--text-3); border-radius:3px; transition:width 1s linear }
 
 /* ── toast ────────────────────────────────────────────────────────────── */
 .toast {
@@ -430,7 +438,63 @@ body {
 .modal-foot { display:flex; gap:9px; justify-content:flex-end; padding:14px 20px; border-top:1px solid var(--line) }
 
 /* ── chart ────────────────────────────────────────────────────────────── */
-.chart-wrap { padding:16px 12px 4px 4px; height:260px }
+/* Height lives on the ResponsiveContainer in App.tsx (220px) — one source of
+   truth. A second height here either wastes rows or clips the legend. */
+.chart-wrap { padding:6px 12px 4px 4px }
+
+.chart-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:12px 16px 0 }
+.chart-toolbar select {
+  height:30px; padding:0 10px; border-radius:7px; cursor:pointer;
+  border:1px solid var(--line-2); background:var(--raised); color:var(--text);
+  font:500 12.5px/1 'IBM Plex Sans', sans-serif;
+}
+.chart-toolbar select:hover { border-color:var(--brand) }
+
+/* ── segmented filter ────────────────────────────────────────────────────
+   All options stay visible with their counts, so the cost of a choice is
+   known before it's made; the active state is carried by background AND
+   aria-pressed, never colour alone. */
+.seg {
+  display:inline-flex; align-items:center; gap:2px; padding:2px;
+  border:1px solid var(--line-2); border-radius:8px; background:var(--raised);
+}
+.seg button {
+  display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 10px;
+  border:none; border-radius:6px; background:transparent; color:var(--text-2);
+  font:500 12.5px/1 'IBM Plex Sans', sans-serif; cursor:pointer; white-space:nowrap;
+}
+.seg button:hover { color:var(--text) }
+.seg button[aria-pressed="true"] {
+  background:var(--brand-soft); color:var(--brand); font-weight:600;
+}
+.seg-n { font:400 11px/1 'IBM Plex Mono', monospace; opacity:.75 }
+
+/* ── export menu ─────────────────────────────────────────────────────── */
+.export { position:relative; display:inline-flex }
+.export .menu {
+  position:absolute; right:0; top:calc(100% + 6px); z-index:30; min-width:200px;
+  padding:4px; border:1px solid var(--line-2); border-radius:9px;
+  background:var(--panel); box-shadow:var(--shadow);
+}
+.export .menu button {
+  display:flex; flex-direction:column; align-items:flex-start; gap:2px;
+  width:100%; padding:8px 10px; border:none; border-radius:6px;
+  background:transparent; color:var(--text); text-align:left; cursor:pointer;
+  font:600 13px/1.2 'IBM Plex Sans', sans-serif;
+}
+.export .menu button:hover, .export .menu button:focus-visible { background:var(--raised) }
+.export .menu button small { font-weight:400; font-size:11.5px; color:var(--text-3) }
+
+/* ── log history controls ────────────────────────────────────────────── */
+.history-bar {
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:8px 16px; border-bottom:1px solid var(--line);
+  background:var(--brand-soft);
+}
+.loadmore {
+  display:flex; justify-content:center; align-items:center;
+  padding:12px 16px; border-top:1px solid var(--line);
+}
 .legend { display:flex; gap:16px; flex-wrap:wrap; padding:0 16px 14px; font-size:12.5px; color:var(--text-2) }
 .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; vertical-align:-1px }
 .recharts-surface:focus { outline:none }
@@ -469,8 +533,6 @@ body {
 
 /* ── responsive ───────────────────────────────────────────────────────── */
 @media (max-width:960px) {
-  .status { flex-wrap:wrap }
-  .meter { width:100%; border-left:0; border-top:1px solid var(--line) }
   .ledger { grid-template-columns:repeat(2,1fr) }
   .log { grid-template-columns:1fr; gap:2px; padding:10px 16px }
   .cell-ip { width:150px }
@@ -479,9 +541,8 @@ body {
 @media (max-width:640px) {
   .app { padding:0 12px 32px }
   .topbar { padding:0 12px; gap:8px }
-  .verdict { font-size:23px }
-  .status .body { padding:16px }
-  .meter { padding:16px }
+  .status { padding:11px 12px 11px 0 }
+  .status .spine { margin:-11px 0 }
   /* 38px minimum touch target — below ~36px, tap error rates climb sharply. */
   .btn, .tab { min-height:38px }
   .row { flex-wrap:wrap; gap:8px }

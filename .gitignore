@@ -23,3 +23,11 @@ localstack_data/
 # OS
 .DS_Store
 Thumbs.db
+.env
+*.zip
+*.mmdb
+pool-*.json
+client-*.json
+userpool-backup-*.json
+node_modules/
+dist/

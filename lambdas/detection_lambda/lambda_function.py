@@ -25,6 +25,7 @@ import urllib.parse
 from datetime import datetime, timezone
 
 import boto3
+from botocore.exceptions import ClientError
 
 from anomaly_detector_engine import AnomalyDetectorEngine
 
@@ -169,16 +170,27 @@ def _decode_cwlogs_direct(event) -> list:
 
 
 def _get_window_counters(ip: str) -> dict:
-    """Fetch the current rolling-window counters for this IP from DynamoDB."""
+    """
+    Fetch the current rolling-window counters for this IP from DynamoDB.
+
+    ConsistentRead is mandatory here. The window is a read-modify-write cycle,
+    and DynamoDB's default eventually-consistent read can return a copy that is
+    milliseconds stale. During a burst that silently undercounts
+    total_requests, so the volume rules (>= 60, >= 300) never fire and every
+    detection degrades to an ML-only MEDIUM/HIGH.
+    """
     try:
-        resp = dynamo.get_item(TableName=WINDOW_TABLE, Key={"ip": {"S": ip}})
+        resp = dynamo.get_item(
+            TableName=WINDOW_TABLE,
+            Key={"ip": {"S": ip}},
+            ConsistentRead=True,
+        )
         item = resp.get("Item")
         if not item:
             return {"events": []}
-        return json.loads(item.get("events_json", {}).get("S", "[]")) and {
-            "events": json.loads(item["events_json"]["S"])
-        } or {"events": []}
-    except Exception:
+        return {"events": json.loads(item.get("events_json", {}).get("S", "[]"))}
+    except Exception as exc:
+        print(f"[WARN] Could not read window state for {ip}: {exc}")
         return {"events": []}
 
 
@@ -269,49 +281,115 @@ def _write_alert(ip: str, features: dict, result: dict):
 
 SEVERITY_RANK = {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
-
-def _existing_block_severity(ip: str):
-    """
-    Return the severity string of this IP's active blocklist entry, or None if
-    it isn't currently blocked. Used to deduplicate repeated detections while
-    still allowing severity *escalation*: if a later detection is more severe
-    than the recorded one (e.g. a flood that starts as HIGH and grows to
-    CRITICAL), we upgrade the alert/block rather than suppressing it.
-    """
-    try:
-        resp = dynamo.get_item(TableName=BLOCKLIST_TABLE, Key={"ip": {"S": ip}})
-        item = resp.get("Item")
-        if not item:
-            return None
-        return item.get("severity", {}).get("S", "LOW")
-    except Exception:
-        return None  # on error, treat as not blocked — better a dup than a miss
+# Faults that are temporary and self-clearing. Anything NOT in this set is a
+# configuration or permissions fault that will recur on every single event.
+_TRANSIENT_DDB_ERRORS = {
+    "ProvisionedThroughputExceededException",
+    "ThrottlingException",
+    "RequestLimitExceeded",
+    "InternalServerError",
+    "ServiceUnavailable",
+    "TransactionConflictException",
+}
 
 
 def _block_ip(ip: str, features: dict, result: dict):
+    """
+    Atomically claim the block for this IP. Returns (blocked_now, prior_severity).
+
+    The old flow read the blocklist first and decided afterwards — two
+    concurrent invocations (a burst of attack requests fans out across
+    Lambdas) both read "not blocked", both fell through, and both sent a
+    Telegram message. The decision now lives INSIDE DynamoDB as a conditional
+    write, which is atomic: exactly one writer wins per severity level.
+
+      - IP not blocked                          -> write succeeds, notify once
+      - blocked at LOWER severity (escalation)  -> write succeeds, notify once,
+                                                   prior severity returned so the
+                                                   message can say "escalated"
+      - blocked at same/higher severity (dup)   -> ConditionalCheckFailed, silent
+
+      - block TTL already expired                -> write succeeds, notify once
+                                                   (a lapsed block must be
+                                                   re-armed, and DynamoDB's TTL
+                                                   sweeper can lag by up to 48h)
+
+    Condition expressions accept only attribute_exists, attribute_not_exists,
+    attribute_type, begins_with, contains and size. if_not_exists() is an
+    UPDATE-expression function and is rejected here with a ValidationException,
+    so the "treat a missing rank as 0" case is expressed as an explicit
+    attribute_not_exists(severity_rank) clause instead.
+
+    `ttl` is a DynamoDB reserved word, so it is referenced via the #ttl alias.
+    """
     severity    = result.get("severity", "MEDIUM")
+    rank        = SEVERITY_RANK.get(severity, 2)
     ttl_seconds = TTL_BY_SEVERITY.get(severity, 3600)
-    ttl_epoch   = int(time.time()) + ttl_seconds
+    now_epoch   = int(time.time())
+    ttl_epoch   = now_epoch + ttl_seconds
 
     try:
-        dynamo.put_item(
+        resp = dynamo.put_item(
             TableName=BLOCKLIST_TABLE,
             Item={
-                "ip":          {"S": ip},
-                "blocked_at":  {"S": datetime.now(timezone.utc).isoformat()},
-                "reason":      {"S": result.get("reason", "ML anomaly")},
-                "score":       {"N": str(result.get("score", 0))},
-                "source":      {"S": "acs-auto-block"},
-                "geo_anomaly": {"N": str(features.get("geo_anomaly", 0))},
-                "severity":    {"S": severity},
-                "ttl":         {"N": str(ttl_epoch)},
+                "ip":            {"S": ip},
+                "blocked_at":    {"S": datetime.now(timezone.utc).isoformat()},
+                "reason":        {"S": result.get("reason", "ML anomaly")},
+                "score":         {"N": str(result.get("score", 0))},
+                "source":        {"S": "acs-auto-block"},
+                "geo_anomaly":   {"N": str(features.get("geo_anomaly", 0))},
+                "severity":      {"S": severity},
+                "severity_rank": {"N": str(rank)},
+                "ttl":           {"N": str(ttl_epoch)},
             },
+            ConditionExpression=(
+                "attribute_not_exists(ip) "
+                "OR attribute_not_exists(severity_rank) "
+                "OR severity_rank < :rank "
+                "OR #ttl < :now"
+            ),
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={
+                ":rank": {"N": str(rank)},
+                ":now":  {"N": str(now_epoch)},
+            },
+            ReturnValues="ALL_OLD",
         )
-    except Exception as exc:
-        print(f"[ERROR] Failed to write blocked-ips entry: {exc}")
+        old   = resp.get("Attributes") or {}
+        prior = old.get("severity", {}).get("S") if old else None
+        if WAF_IPSET_ID:
+            _add_ip_to_waf_set(ip)
+        return True, prior
 
-    if WAF_IPSET_ID:
-        _add_ip_to_waf_set(ip)
+    except dynamo.exceptions.ConditionalCheckFailedException:
+        # Already blocked at equal or higher severity, and still within TTL.
+        # This is the duplicate path: stay silent. The WAF entry already exists
+        # (idempotent add on the invocation that won the write).
+        return False, None
+
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "Unknown")
+        if code in _TRANSIENT_DDB_ERRORS:
+            # Throttle or a brief service fault: rare and self-clearing, so
+            # failing open cannot storm. Enforce at the WAF and let the caller
+            # notify — a repeated message beats a silent miss.
+            print(f"[WARN] Transient DynamoDB fault on blocklist write ({code}) — alerting anyway.")
+            if WAF_IPSET_ID:
+                _add_ip_to_waf_set(ip)
+            return True, None
+        # Permanent fault (ValidationException, AccessDeniedException,
+        # ResourceNotFoundException). These fail identically for EVERY event,
+        # so failing open here emits one alert and one Telegram message per
+        # request. Fail closed and make the fault loud in CloudWatch instead:
+        # an empty blocklist is an honest signal that enforcement is broken,
+        # whereas an alert storm hides it.
+        print(f"[ERROR] Blocklist write REJECTED ({code}) for {ip}: {exc}")
+        print("[ERROR] Block not recorded and no alert raised — this is a configuration fault, not traffic.")
+        return False, None
+
+    except Exception as exc:
+        print(f"[ERROR] Unexpected blocklist failure for {ip}: {exc}")
+        return False, None
 
 
 def _add_ip_to_waf_set(ip: str, max_retries: int = 5):
@@ -351,7 +429,7 @@ def _add_ip_to_waf_set(ip: str, max_retries: int = 5):
     print(f"[WARN] WAF IP Set update gave up after {max_retries} retries for {ip}")
 
 
-def _send_telegram(ip: str, features: dict, result: dict):
+def _send_telegram(ip: str, features: dict, result: dict, escalated_from: str = None):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         print(f"[TELEGRAM DISABLED] Would alert on {ip}: {result.get('reason')}")
         return
@@ -361,8 +439,12 @@ def _send_telegram(ip: str, features: dict, result: dict):
     emoji    = {"CRITICAL": "\U0001F534", "HIGH": "\U0001F7E0", "MEDIUM": "\U0001F7E1", "LOW": "\U0001F7E2"}.get(severity, "\u26AA")
     ttl_h    = TTL_BY_SEVERITY.get(severity, 3600) // 3600
 
+    header = "ACS Sentinel Alert"
+    if escalated_from:
+        header = f"ACS Sentinel Alert \u2B06 escalated from {escalated_from}"
+
     msg = (
-        f"ACS Sentinel Alert\n"
+        f"{header}\n"
         f"{emoji} Severity : {severity}\n"
         f"Threat    : {threat}\n"
         f"IP Blocked: {ip}\n"
@@ -398,6 +480,10 @@ def _process_events(log_events, engine) -> int:
                 TableName=LOGSTREAM_TABLE,
                 Item={
                     "log_id":      {"S": log_id},
+                    # Constant partition key for the "by-time" GSI: lets the
+                    # dashboard Query newest-first instead of Scanning the whole
+                    # table on every poll (correct ordering AND ~free reads).
+                    "gsi_pk":      {"S": "LOG"},
                     "timestamp":   {"S": datetime.now(timezone.utc).isoformat()},
                     "level":       {"S": level},
                     "source":      {"S": "acs-sentinel"},
@@ -411,20 +497,15 @@ def _process_events(log_events, engine) -> int:
             print(f"[ERROR] Failed to write log entry: {exc}")
 
         if result["is_anomaly"]:
-            # Dedup WITH escalation: if this IP is already blocked at an equal or
-            # higher severity, skip (avoids duplicate-alert spam from a burst).
-            # But if the new detection is MORE severe (e.g. a flood that grows
-            # from HIGH to CRITICAL as its window fills), upgrade the alert and
-            # block so the recorded severity reflects the worst observed threat.
-            new_sev  = result.get("severity", "MEDIUM")
-            prior_sev = _existing_block_severity(ip)
-            if prior_sev is not None:
-                if SEVERITY_RANK.get(new_sev, 0) <= SEVERITY_RANK.get(prior_sev, 0):
-                    continue  # not more severe — suppress duplicate
-                # else: fall through to re-write at the higher severity (escalation)
+            # The blocklist write IS the dedup gate (see _block_ip). Alert and
+            # notification only fire for the invocation that won the write, so
+            # one case = one Telegram message, however many concurrent Lambdas
+            # the burst fanned out to. Escalations win again by design.
+            blocked_now, prior_sev = _block_ip(ip, features, result)
+            if not blocked_now:
+                continue  # duplicate of an active block — already alerted
             _write_alert(ip, features, result)
-            _block_ip(ip, features, result)
-            _send_telegram(ip, features, result)
+            _send_telegram(ip, features, result, escalated_from=prior_sev)
 
     return processed
 
