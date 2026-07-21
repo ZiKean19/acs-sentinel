@@ -92,3 +92,55 @@ export async function unblockIP(ip: string): Promise<void> {
   })
   if (!res.ok) throw new Error(`Unblock failed: HTTP ${res.status}`)
 }
+
+/* ── User management (admin-only) ──────────────────────────────────────────
+ * All actions post to the single /users route with an `action` discriminator.
+ * The Lambda re-checks cognito:groups server-side, so a non-admin token gets a
+ * 403 here even though the UI never shows these controls to operators. */
+
+export type ManagedRole = 'admin' | 'operator'
+
+export interface ManagedAccount {
+  username:  string
+  federated: boolean
+  status:    string
+  is_admin:  boolean
+}
+
+export interface ManagedUser {
+  email:         string
+  invited:       boolean
+  intended_role: string
+  joined:        boolean
+  role:          string        // 'admin' | 'operator' | '—'
+  accounts:      ManagedAccount[]
+  added_by:      string
+  added_at:      string
+}
+
+export interface DomainAllow {
+  domain:   string
+  added_by: string
+}
+
+export interface UserList {
+  users:   ManagedUser[]
+  domains: DomainAllow[]
+}
+
+async function usersPost<T>(payload: Record<string, unknown>): Promise<T> {
+  const headers = { ...(await authHeaders()), 'Content-Type': 'application/json' }
+  const res = await fetch(`${BASE_URL}/users`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  })
+  const data = await res.json().catch(() => ({} as any))
+  if (!res.ok) throw new Error((data && (data.error as string)) || `HTTP ${res.status}`)
+  return data as T
+}
+
+export const listUsers   = ()                                   => usersPost<UserList>({ action: 'list' })
+export const inviteUser  = (email: string, role: ManagedRole)   => usersPost<{ status: string }>({ action: 'invite', email, role })
+export const removeUser  = (email: string)                      => usersPost<{ status: string }>({ action: 'remove', email })
+export const setUserRole = (email: string, role: ManagedRole)   => usersPost<{ status: string, note?: string }>({ action: 'setrole', email, role })

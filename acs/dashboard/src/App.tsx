@@ -2,15 +2,16 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import {
   Shield, ShieldCheck, Activity, Ban, Bell, Terminal, LogOut, Sun, Moon,
   RefreshCw, X, Search, AlertTriangle, AlertCircle, MinusCircle,
-  CheckCircle2, History, Wifi, WifiOff, Inbox, Download,
+  CheckCircle2, History, Wifi, WifiOff, Inbox, Download, Users, UserPlus, Trash2,
 } from 'lucide-react'
 import {
   ComposedChart, Area, Scatter, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid,
 } from 'recharts'
 import { fetchAlerts, fetchBlockedIPs, fetchLogs, fetchLogPage, unblockIP } from './api/client'
-import type { Alert, BlockedIP, LogEntry } from './api/client'
+import { listUsers, inviteUser, removeUser, setUserRole } from './api/client'
+import type { Alert, BlockedIP, LogEntry, ManagedUser, ManagedRole, DomainAllow } from './api/client'
 import { usePolling } from './hooks/usePolling'
-import { signIn, signOut, signInWithGoogle, completeOAuthRedirect, isAuthenticated } from './api/auth'
+import { signIn, signOut, signInWithGoogle, completeOAuthRedirect, isAuthenticated, getRole, getEmail, type Role } from './api/auth'
 
 export type { Alert, BlockedIP, LogEntry }
 
@@ -708,7 +709,11 @@ function SeverityDot({ cx, cy, payload }: any) {
 
 function BreachDot({ cx, cy, payload }: any) {
   if (cx == null || cy == null || !payload || payload.raw >= IF_THRESHOLD) return null
-  return <circle cx={cx} cy={cy} r={4} fill="var(--sev-critical)" stroke="var(--panel)" strokeWidth={2} />
+  // Colour by severity so a breach reads the same here as in the Anomalies tab
+  // and in the severity ledger — red no longer doubles as both "anomaly" and
+  // "critical". Falls back to the shared unknown grey when severity is absent.
+  return <circle cx={cx} cy={cy} r={4} fill={`var(--sev-${sevKey(payload.severity)})`}
+    stroke="var(--panel)" strokeWidth={2} />
 }
 
 /** Plots the LOG STREAM, not the alerts table. Every row in `alerts` has already
@@ -941,10 +946,11 @@ function AnomalyChart({ logs, alerts, onRunSim }: { logs: LogEntry[], alerts: Al
             <span><i style={{ background: 'var(--sev-critical)' }} />Alert threshold · 50% (score {num(IF_THRESHOLD, 2)})</span>
             {/* The breach dot only paints below the threshold, which the normal
                 filter excludes by definition — so in that tab the swatch would
-                point at something the chart can never draw. */}
-            {traffic === 'all' && (
-              <span><i style={{ background: 'var(--sev-critical)', borderRadius: '50%' }} />Anomalies</span>
-            )}
+                point at something the chart can never draw. In All traffic the
+                dots are severity-coloured, so the legend names each level. */}
+            {traffic === 'all' && SEV_LEVELS.map(k => (
+              <span key={k}><i style={{ background: `var(--sev-${k})`, borderRadius: '50%' }} />{titleCase(k)}</span>
+            ))}
           </>
         ) : mode === 'baseline' ? (
           <>
@@ -1494,7 +1500,182 @@ const ALERT_COLUMNS: Col<Alert>[] = [
   { label: 'Status', value: a => a.status },
 ]
 
-function Dashboard({ onLogout, theme, toggleTheme }: { onLogout: () => void, theme: Theme, toggleTheme: () => void }) {
+function UsersPanel({ myEmail }: { myEmail: string }) {
+  const [users, setUsers] = useState<ManagedUser[] | null>(null)
+  const [domains, setDomains] = useState<DomainAllow[]>([])
+  const [error, setError] = useState('')
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState('')                 // email (or '__invite__') mid-action
+  const [confirmRemove, setConfirmRemove] = useState('')
+  const [inviteEmail, setInviteEmail] = useState('')
+  const [inviteRole, setInviteRole] = useState<ManagedRole>('operator')
+
+  const load = useCallback(async () => {
+    setError('')
+    try {
+      const r = await listUsers()
+      setUsers(r.users)
+      setDomains(r.domains)
+    } catch (e: any) {
+      setError(e?.message || 'Could not load the team list.')
+    }
+  }, [])
+
+  useEffect(() => { load() }, [load])
+
+  const flash = (m: string) => { setMsg(m); window.setTimeout(() => setMsg(''), 5000) }
+
+  const doInvite = async () => {
+    const email = inviteEmail.trim().toLowerCase()
+    if (!email) return
+    const dup = email.startsWith('@')
+      ? domains.some(d => d.domain === email)
+      : (users || []).some(u => u.email === email)
+    if (dup) { setError(`${email} is already on the team.`); return }
+    setBusy('__invite__'); setError('')
+    try {
+      await inviteUser(email, inviteRole)
+      setInviteEmail('')
+      flash(`Invited ${email} as ${inviteRole}. They can sign in with Google using this address.`)
+      await load()
+    } catch (e: any) { setError(e?.message || 'Invite failed.') }
+    finally { setBusy('') }
+  }
+
+  const doSetRole = async (email: string, role: ManagedRole) => {
+    setBusy(email); setError('')
+    try {
+      const r = await setUserRole(email, role)
+      flash(r.note ? `${email}: ${r.note}` : `${email} is now ${role}.`)
+      await load()
+    } catch (e: any) { setError(e?.message || 'Role change failed.') }
+    finally { setBusy('') }
+  }
+
+  const doRemove = async (email: string) => {
+    setBusy(email); setError(''); setConfirmRemove('')
+    try {
+      await removeUser(email)
+      flash(`Removed ${email}.`)
+      await load()
+    } catch (e: any) { setError(e?.message || 'Remove failed.') }
+    finally { setBusy('') }
+  }
+
+  const field: React.CSSProperties = {
+    height: 34, padding: '0 12px', borderRadius: 7,
+    border: '1px solid var(--line-2)', background: 'var(--panel)', color: 'var(--text)',
+    font: "400 13px/1 'IBM Plex Sans', sans-serif",
+  }
+
+  if (users === null && !error) return <Spinner label="Loading team…" />
+  const list = users || []
+
+  return (
+    <div className="stack">
+      <div className="card">
+        <div className="toolbar">
+          <span className="card-title"><Users size={15} color="var(--brand)" aria-hidden="true" /> Team access</span>
+          <span className="count">{list.length} {list.length === 1 ? 'person' : 'people'}</span>
+          <div className="spacer" />
+          <button className="btn sm ghost" onClick={load} title="Refresh"><RefreshCw size={13} />Refresh</button>
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', padding: 16, paddingBottom: 0, alignItems: 'center' }}>
+          <input type="email" value={inviteEmail} onChange={e => setInviteEmail(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') doInvite() }}
+            placeholder="name@example.com  (or @domain.com for a whole domain)"
+            aria-label="Email to invite" style={{ ...field, flex: '1 1 260px' }} />
+          <select value={inviteRole} onChange={e => setInviteRole(e.target.value as ManagedRole)}
+            aria-label="Role" style={field}>
+            <option value="operator">Operator</option>
+            <option value="admin">Admin</option>
+          </select>
+          <button className="btn primary" onClick={doInvite} disabled={busy === '__invite__' || !inviteEmail.trim()}>
+            <UserPlus size={14} />{busy === '__invite__' ? 'Inviting…' : 'Invite'}
+          </button>
+        </div>
+        <p className="modal-note" style={{ padding: '10px 16px 0' }}>
+          Invited people sign in with Google — no password needed. Role changes apply after the person signs out and back in.
+        </p>
+
+        {msg && (
+          <div className="form-error" style={{ margin: 16, marginBottom: 0, color: 'var(--ok)' }} role="status">
+            <CheckCircle2 size={15} aria-hidden="true" /><span>{msg}</span>
+          </div>
+        )}
+        {error && (
+          <div className="form-error" style={{ margin: 16, marginBottom: 0 }} role="alert">
+            <AlertTriangle size={15} aria-hidden="true" /><span>{error}</span>
+          </div>
+        )}
+
+        {list.length === 0 ? (
+          <EmptyState icon={<Users size={22} />} title="No one on the team yet"
+            body="Invite a teammate by email above. They’ll sign in with Google — no password to share." />
+        ) : (
+          <div style={{ padding: 16 }}>
+            {list.map(u => {
+              const isSelf = u.email === myEmail
+              const isAdminRow = u.role === 'admin'
+              const acting = busy === u.email
+              return (
+                <div key={u.email} style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', padding: '10px 0', borderBottom: '1px solid var(--line)' }}>
+                  <div style={{ flex: '1 1 220px', minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {u.email}{isSelf && <span className="chip" style={{ marginLeft: 8 }}>You</span>}
+                    </div>
+                    <div className="mono" style={{ fontSize: 12, opacity: 0.7 }}>
+                      {u.joined ? 'Active' : 'Invited — not signed in yet'}{u.accounts.some(a => a.federated) ? ' · Google' : ''}
+                    </div>
+                  </div>
+
+                  <span className="chip" style={isAdminRow ? { color: 'var(--brand)', borderColor: 'var(--brand)' } : (!u.joined ? { opacity: 0.6 } : undefined)}>
+                    {isAdminRow ? <ShieldCheck size={13} /> : <Shield size={13} />}
+                    {u.role === '—' ? 'Pending' : u.role.charAt(0).toUpperCase() + u.role.slice(1)}
+                  </span>
+
+                  {u.joined && (isAdminRow ? (
+                    <button className="btn sm" disabled={acting || isSelf}
+                      title={isSelf ? 'You cannot remove your own admin access' : 'Demote to operator'}
+                      onClick={() => doSetRole(u.email, 'operator')}>
+                      {acting ? '…' : 'Make operator'}
+                    </button>
+                  ) : (
+                    <button className="btn sm" disabled={acting}
+                      title="Promote to admin" onClick={() => doSetRole(u.email, 'admin')}>
+                      {acting ? '…' : 'Make admin'}
+                    </button>
+                  ))}
+
+                  {confirmRemove === u.email ? (
+                    <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center' }}>
+                      <span style={{ fontSize: 12 }}>Remove?</span>
+                      <button className="btn sm" disabled={acting} style={{ color: 'var(--sev-critical-fg)', borderColor: 'var(--sev-critical-fg)' }}
+                        onClick={() => doRemove(u.email)}>
+                        {acting ? 'Removing…' : 'Yes, remove'}
+                      </button>
+                      <button className="btn sm ghost" onClick={() => setConfirmRemove('')}>Cancel</button>
+                    </span>
+                  ) : (
+                    <button className="btn sm ghost" disabled={acting || isSelf}
+                      title={isSelf ? 'You cannot remove your own account' : 'Revoke access and delete account'}
+                      onClick={() => setConfirmRemove(u.email)} aria-label={`Remove ${u.email}`}>
+                      <Trash2 size={13} />
+                    </button>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function DashboardView({ onLogout, theme, toggleTheme, role }: { onLogout: () => void, theme: Theme, toggleTheme: () => void, role: Role }) {
+  const isAdmin = role === 'admin'
   const { data: alerts, status: alertsStatus, reset: resetAlerts } = usePolling<Alert[]>(fetchAlerts, [], { intervalMs: 4000 })
   const { data: blockedIPs, status: blockedStatus, reset: resetBlocked } = usePolling<BlockedIP[]>(fetchBlockedIPs, [], { intervalMs: 4000 })
   const { data: logs, status: logsStatus, reset: resetLogs } = usePolling<LogEntry[]>(fetchLogs, [], { intervalMs: 4000 })
@@ -1504,8 +1685,12 @@ function Dashboard({ onLogout, theme, toggleTheme }: { onLogout: () => void, the
   const ipsError = blockedStatus === 'error'
   const logsError = logsStatus === 'error'
 
-  const [tab, setTab] = useState<'overview' | 'logs' | 'blocklist'>('overview')
+  const [tab, setTab] = useState<'overview' | 'logs' | 'blocklist' | 'users'>('overview')
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null)
+  // The signed-in admin's own email — used to stop them removing or demoting
+  // their own account and locking themselves out.
+  const [myEmail, setMyEmail] = useState('')
+  useEffect(() => { let c = false; getEmail().then(e => { if (!c) setMyEmail(e) }); return () => { c = true } }, [])
 
   const handleUnblock = async (ip: string) => { await unblockIP(ip); resetBlocked() }
   const criticalAlerts = (alerts as Alert[]).filter(a => a.severity === 'CRITICAL')
@@ -1529,6 +1714,7 @@ function Dashboard({ onLogout, theme, toggleTheme }: { onLogout: () => void, the
     { id: 'overview' as const, label: 'Overview', icon: Activity },
     { id: 'logs' as const, label: 'Log stream', icon: Terminal },
     { id: 'blocklist' as const, label: 'Blocked IPs', icon: Ban, badge: (blockedIPs as BlockedIP[]).length },
+    ...(isAdmin ? [{ id: 'users' as const, label: 'Users', icon: Users }] : []),
   ]
 
   return (
@@ -1552,6 +1738,13 @@ function Dashboard({ onLogout, theme, toggleTheme }: { onLogout: () => void, the
             {connected ? <><Wifi size={13} aria-hidden="true" />Live</>
               : anyError ? <><WifiOff size={13} aria-hidden="true" />Reconnecting</>
                 : <><RefreshCw size={13} className="spin" aria-hidden="true" />Connecting</>}
+          </div>
+
+          <div className="chip hide-sm"
+            title={isAdmin ? 'Administrator — full access including user management' : 'Operator — full monitoring and remediation'}
+            style={isAdmin ? { color: 'var(--brand)', borderColor: 'var(--brand)' } : undefined}>
+            {isAdmin ? <ShieldCheck size={13} aria-hidden="true" /> : <Shield size={13} aria-hidden="true" />}
+            {isAdmin ? 'Admin' : 'Operator'}
           </div>
 
           <ThemeButton theme={theme} toggleTheme={toggleTheme} />
@@ -1582,7 +1775,7 @@ function Dashboard({ onLogout, theme, toggleTheme }: { onLogout: () => void, the
           <div className="stack">
             <div className="card">
               <div className="card-head">
-                <span className="card-title">Anomaly score over time</span>
+                <span className="card-title">Anomaly score timeline</span>
                 <span className="card-hint hide-sm">Malaysia time</span>
                 <div className="spacer" />
                 <button className="btn sm ghost" onClick={resetLogs} title="Refresh now">
@@ -1615,6 +1808,10 @@ function Dashboard({ onLogout, theme, toggleTheme }: { onLogout: () => void, the
           <BlocklistPanel ips={blockedIPs as BlockedIP[]} logs={logs as LogEntry[]}
             loading={blockedStatus === 'connecting'} error={ipsError}
             onUnblock={handleUnblock} onRefresh={resetBlocked} />
+        )}
+
+        {tab === 'users' && isAdmin && (
+          <UsersPanel myEmail={myEmail} />
         )}
 
         <footer className="foot">
@@ -1721,4 +1918,17 @@ export default function App() {
 
   if (!authenticated) return <LoginScreen onLogin={() => setAuthenticated(true)} theme={theme} toggleTheme={toggleTheme} initialError={oauthError} />
   return <Dashboard onLogout={() => { signOut(); setAuthenticated(false) }} theme={theme} toggleTheme={toggleTheme} />
+}
+
+function Dashboard(props: { onLogout: () => void, theme: Theme, toggleTheme: () => void }) {
+  // Resolve the caller's role once the session exists. Defaults to the least
+  // privilege (operator) until the token is read, so the unblock controls never
+  // flash as enabled for a non-admin during the first paint.
+  const [role, setRole] = useState<Role>('operator')
+  useEffect(() => {
+    let cancelled = false
+    getRole().then(r => { if (!cancelled) setRole(r) })
+    return () => { cancelled = true }
+  }, [])
+  return <DashboardView {...props} role={role} />
 }

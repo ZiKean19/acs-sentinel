@@ -51,6 +51,13 @@ WAF_IPSET_ID    = os.environ.get("WAF_IPSET_ID", "")
 WAF_IPSET_NAME  = os.environ.get("WAF_IPSET_NAME", "acs-blocked-ips")
 WAF_IPSET_SCOPE = os.environ.get("WAF_IPSET_SCOPE", "REGIONAL")
 
+# User management (admin-only). The allowlist table is the same one the
+# PreSignUp trigger reads; role changes are enforced through Cognito group
+# membership, which is what actually lands in the JWT and gates these routes.
+USER_POOL_ID    = os.environ.get("COGNITO_USER_POOL_ID", "ap-southeast-1_D8EGJnIiP")
+ALLOWLIST_TABLE = os.environ.get("ALLOWLIST_TABLE", "allowed-users")
+ADMIN_GROUP     = "admin"
+
 TELEGRAM_TOKEN          = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 # Random string you choose at setWebhook time. Telegram echoes it back in the
 # X-Telegram-Bot-Api-Secret-Token header on every webhook call; anything that
@@ -62,8 +69,9 @@ POLL_LIMIT_DEFAULT = 300      # newest rows returned to the 4s poll
 PAGE_LIMIT_MAX     = 500      # hard cap per request
 SEARCH_QUERY_PAGES = 8        # DynamoDB pages walked per search request
 
-dynamo = boto3.client("dynamodb", region_name=AWS_REGION)
-wafv2  = boto3.client("wafv2", region_name=AWS_REGION)
+dynamo  = boto3.client("dynamodb", region_name=AWS_REGION)
+wafv2   = boto3.client("wafv2", region_name=AWS_REGION)
+cognito = boto3.client("cognito-idp", region_name=AWS_REGION)
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin":  "*",
@@ -244,11 +252,34 @@ def _remove_from_waf(ip: str):
         print(f"[WARN] WAF removal failed: {exc}")
 
 
-def _unblock_ip(ip: str, actor: str = "dashboard"):
+def _unblock_ip(ip: str, actor: str = "dashboard") -> bool:
+    """Unblock an IP. Idempotent, and always removes the block.
+
+    The delete runs UNCONDITIONALLY — deleting an absent row is a harmless no-op
+    that still succeeds — so the block is guaranteed to be gone and the dashboard
+    always reflects it. ReturnValues=ALL_OLD then tells us whether a row was
+    actually there: only a real removal cleans WAF and writes an audit row. An IP
+    that escalates medium -> high -> critical has three Telegram alerts but one
+    blocklist row, so the first tap records the unblock and the rest report
+    'already unblocked' without duplicating the audit trail.
+
+    (Earlier this used a conditional delete keyed on attribute_exists(ip); if the
+    condition ever failed for a live block the whole unblock silently no-op'd —
+    the IP stayed blocked and nothing was recorded. ReturnValues avoids that.)
+    """
     try:
-        dynamo.delete_item(TableName=BLOCKLIST_TABLE, Key={"ip": {"S": ip}})
+        resp = dynamo.delete_item(
+            TableName=BLOCKLIST_TABLE,
+            Key={"ip": {"S": ip}},
+            ReturnValues="ALL_OLD",
+        )
+        existed = "Attributes" in resp
     except Exception as exc:
         print(f"[ERROR] DynamoDB delete failed: {exc}")
+        existed = True   # unknown state — treat as real so WAF is cleaned and recorded
+
+    if not existed:
+        return False     # was already unblocked — no WAF churn, no duplicate audit
 
     _remove_from_waf(ip)
 
@@ -269,6 +300,7 @@ def _unblock_ip(ip: str, actor: str = "dashboard"):
         )
     except Exception as exc:
         print(f"[ERROR] Audit log write failed: {exc}")
+    return True
 
 
 # ── Telegram webhook ─────────────────────────────────────────────────────────
@@ -302,29 +334,291 @@ def _handle_telegram_webhook(event):
     callback = update.get("callback_query")
     if callback and callback.get("data", "").startswith("unblock:"):
         ip = callback["data"].split("unblock:", 1)[1]
-        _unblock_ip(ip, actor="telegram")
+        did = _unblock_ip(ip, actor="telegram")
 
         # Feedback in the chat itself, or the button looks dead even when it
         # worked: pop a toast on the tapper's screen, then rewrite the alert
         # message so the button disappears and the outcome is recorded inline.
+        # A second/third escalation alert for the same IP is now a no-op — it
+        # reports "already unblocked" instead of logging another unblock.
         _telegram_api("answerCallbackQuery", {
             "callback_query_id": callback["id"],
-            "text": f"Unblocked {ip}",
+            "text": f"Unblocked {ip}" if did else f"{ip} was already unblocked",
         })
         msg = callback.get("message") or {}
         chat_id    = (msg.get("chat") or {}).get("id")
         message_id = msg.get("message_id")
         if chat_id and message_id:
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            note  = "Unblocked" if did else "Already unblocked"
             _telegram_api("editMessageText", {
                 "chat_id":    chat_id,
                 "message_id": message_id,
-                "text":       f"{msg.get('text', '')}\n\n\u2705 Unblocked via Telegram at {stamp}",
+                "text":       f"{msg.get('text', '')}\n\n\u2705 {note} via Telegram at {stamp}",
             })
 
     # Always 200: Telegram retries non-200 responses, which would replay the
     # same callback and re-trigger the unblock path.
     return _response(200, {"ok": True})
+
+
+# ── User management (admin-only) ─────────────────────────────────────────────
+#
+# Authorisation boundary. The frontend hides the Users tab from non-admins, but
+# that is cosmetic: a valid operator token can still call this endpoint. Every
+# action below therefore re-checks cognito:groups from the API Gateway JWT
+# authoriser and refuses anything that is not an admin. This is the real gate.
+
+def _json_body(event) -> dict:
+    raw = event.get("body") or "{}"
+    if event.get("isBase64Encoded"):
+        try:
+            raw = base64.b64decode(raw).decode()
+        except Exception:
+            raw = "{}"
+    try:
+        return json.loads(raw) or {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _claims(event) -> dict:
+    return ((((event.get("requestContext") or {}).get("authorizer") or {}).get("jwt") or {}).get("claims") or {})
+
+
+def _groups(event) -> set:
+    # HTTP API (payload 2.0) serialises the cognito:groups array claim as a
+    # bracketed, space-separated string, e.g. "[admin operator]". Accept both
+    # that and a genuine list so the check is not brittle across API versions.
+    raw = _claims(event).get("cognito:groups", "")
+    if isinstance(raw, list):
+        return {g for g in raw if g}
+    return {g for g in raw.strip("[]").replace(",", " ").split() if g}
+
+
+def _is_admin(event) -> bool:
+    return ADMIN_GROUP in _groups(event)
+
+
+def _caller_email(event) -> str:
+    return (_claims(event).get("email") or "").strip().lower()
+
+
+def _audit_log(message: str):
+    """Write an AUDIT row to log-stream so admin actions are accountable. These
+    surface in the log stream alongside traffic and unblock events."""
+    try:
+        dynamo.put_item(
+            TableName=LOGSTREAM_TABLE,
+            Item={
+                "log_id":      {"S": f"{int(time.time() * 1000)}-admin"},
+                "gsi_pk":      {"S": GSI_PK},
+                "timestamp":   {"S": datetime.now(timezone.utc).isoformat()},
+                "level":       {"S": "AUDIT"},
+                "source":      {"S": "acs-dashboard"},
+                "message":     {"S": message},
+                "source_ip":   {"S": ""},
+                "geo_anomaly": {"N": "0"},
+            },
+        )
+    except Exception as exc:
+        print(f"[WARN] audit write failed: {exc}")
+
+
+def _valid_email(email: str) -> bool:
+    if email.startswith("@"):                 # whole-domain allow entry
+        return "." in email[1:] and " " not in email
+    return "@" in email and "." in email.split("@", 1)[1] and " " not in email
+
+
+def _usernames_for_email(email: str) -> list:
+    """Every Cognito username sharing this email — typically a password user
+    and/or a federated Google_ user."""
+    out, token = [], None
+    for _ in range(5):
+        kwargs = {"UserPoolId": USER_POOL_ID, "Filter": f'email = "{email}"', "Limit": 60}
+        if token:
+            kwargs["PaginationToken"] = token
+        resp = cognito.list_users(**kwargs)
+        out.extend(u["Username"] for u in resp.get("Users", []))
+        token = resp.get("PaginationToken")
+        if not token:
+            break
+    return out
+
+
+def _admin_usernames() -> set:
+    out, token = set(), None
+    for _ in range(5):
+        kwargs = {"UserPoolId": USER_POOL_ID, "GroupName": ADMIN_GROUP, "Limit": 60}
+        if token:
+            kwargs["NextToken"] = token
+        resp = cognito.list_users_in_group(**kwargs)
+        out.update(u["Username"] for u in resp.get("Users", []))
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return out
+
+
+def _list_users() -> dict:
+    # Allowlist rows (who MAY enter) keyed by email.
+    allow = {}
+    scan_kwargs = {"TableName": ALLOWLIST_TABLE}
+    while True:
+        resp = dynamo.scan(**scan_kwargs)
+        for i in resp.get("Items", []):
+            e = i.get("email", {}).get("S", "")
+            allow[e] = {
+                "role":     i.get("role", {}).get("S", "operator"),
+                "added_by": i.get("added_by", {}).get("S", ""),
+                "added_at": i.get("added_at", {}).get("S", ""),
+            }
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        scan_kwargs["ExclusiveStartKey"] = lek
+
+    admins = _admin_usernames()
+
+    # Cognito accounts (who HAS entered), grouped by email.
+    accounts_by_email, token = {}, None
+    for _ in range(10):
+        kwargs = {"UserPoolId": USER_POOL_ID, "Limit": 60}
+        if token:
+            kwargs["PaginationToken"] = token
+        resp = cognito.list_users(**kwargs)
+        for u in resp.get("Users", []):
+            uname = u["Username"]
+            attrs = {a["Name"]: a["Value"] for a in u.get("Attributes", [])}
+            e = (attrs.get("email") or "").strip().lower()
+            accounts_by_email.setdefault(e, []).append({
+                "username":  uname,
+                "federated": uname.startswith("Google_"),
+                "status":    u.get("UserStatus", ""),
+                "is_admin":  uname in admins,
+            })
+        token = resp.get("PaginationToken")
+        if not token:
+            break
+
+    users, domains = [], []
+    for email in sorted(set(allow) | set(accounts_by_email)):
+        if email.startswith("@"):
+            domains.append({"domain": email, "added_by": allow.get(email, {}).get("added_by", "")})
+            continue
+        accts = accounts_by_email.get(email, [])
+        joined = len(accts) > 0
+        actual = "admin" if any(a["is_admin"] for a in accts) else ("operator" if joined else "—")
+        users.append({
+            "email":         email,
+            "invited":       email in allow,
+            "intended_role": allow.get(email, {}).get("role", ""),
+            "joined":        joined,
+            "role":          actual,
+            "accounts":      accts,
+            "added_by":      allow.get(email, {}).get("added_by", ""),
+            "added_at":      allow.get(email, {}).get("added_at", ""),
+        })
+    return {"users": users, "domains": domains}
+
+
+def _invite_user(email: str, role: str, actor: str) -> dict:
+    email = email.strip().lower()
+    if not _valid_email(email):
+        return _response(400, {"error": "invalid email or domain"})
+    if email.startswith("@"):
+        role = "domain"
+    elif role not in ("admin", "operator"):
+        role = "operator"
+    dynamo.put_item(
+        TableName=ALLOWLIST_TABLE,
+        Item={
+            "email":    {"S": email},
+            "role":     {"S": role},
+            "added_by": {"S": actor or "admin"},
+            "added_at": {"S": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
+        },
+    )
+    _audit_log(f"USER invited {email} as {role} by {actor or 'admin'}")
+    return _response(200, {"status": "invited", "email": email, "role": role})
+
+
+def _remove_user(email: str, actor: str) -> dict:
+    email = email.strip().lower()
+    if email == actor:
+        return _response(400, {"error": "you cannot remove your own account"})
+    # Remove from the allowlist so they cannot sign back in…
+    dynamo.delete_item(TableName=ALLOWLIST_TABLE, Key={"email": {"S": email}})
+    # …and delete any existing pool accounts so an active session is revoked.
+    removed = []
+    for uname in _usernames_for_email(email):
+        try:
+            cognito.admin_delete_user(UserPoolId=USER_POOL_ID, Username=uname)
+            removed.append(uname)
+        except Exception as exc:
+            print(f"[WARN] admin_delete_user failed for {uname}: {exc}")
+    _audit_log(f"USER removed {email} by {actor} (accounts: {', '.join(removed) or 'none'})")
+    return _response(200, {"status": "removed", "email": email, "accounts_deleted": removed})
+
+
+def _set_role(email: str, role: str, actor: str) -> dict:
+    email = email.strip().lower()
+    if role not in ("admin", "operator"):
+        return _response(400, {"error": "role must be admin or operator"})
+    if email == actor and role != "admin":
+        return _response(400, {"error": "you cannot remove your own admin access"})
+
+    usernames = _usernames_for_email(email)
+    for uname in usernames:
+        try:
+            if role == "admin":
+                cognito.admin_add_user_to_group(UserPoolId=USER_POOL_ID, GroupName=ADMIN_GROUP, Username=uname)
+            else:
+                cognito.admin_remove_user_from_group(UserPoolId=USER_POOL_ID, GroupName=ADMIN_GROUP, Username=uname)
+        except Exception as exc:
+            print(f"[WARN] group change failed for {uname}: {exc}")
+
+    # Keep the allowlist row's intended role in sync for display. Only touch the
+    # role attribute so added_by / added_at survive.
+    try:
+        dynamo.update_item(
+            TableName=ALLOWLIST_TABLE,
+            Key={"email": {"S": email}},
+            UpdateExpression="SET #r = :r",
+            ExpressionAttributeNames={"#r": "role"},
+            ExpressionAttributeValues={":r": {"S": role}},
+        )
+    except Exception as exc:
+        print(f"[WARN] allowlist role sync failed for {email}: {exc}")
+
+    # A group change only lands in a NEW token, so the affected user must sign
+    # out and back in before the dashboard treats them as their new role.
+    _audit_log(f"ROLE {email} set to {role} by {actor}")
+    return _response(200, {
+        "status": "role-updated", "email": email, "role": role,
+        "applied_to": usernames,
+        "note": "user must re-login for the change to take effect" if usernames
+                else "no active account yet — applies on first login is NOT automatic; ask them to sign in, then set role again",
+    })
+
+
+def _handle_users(event) -> dict:
+    if not _is_admin(event):
+        return _response(403, {"error": "administrator access required"})
+    body   = _json_body(event)
+    action = (body.get("action") or "").lower()
+    actor  = _caller_email(event)
+
+    if action == "list":
+        return _response(200, _list_users())
+    if action == "invite":
+        return _invite_user(body.get("email", ""), body.get("role", "operator"), actor)
+    if action == "remove":
+        return _remove_user(body.get("email", ""), actor)
+    if action == "setrole":
+        return _set_role(body.get("email", ""), body.get("role", ""), actor)
+    return _response(400, {"error": "unknown action"})
 
 
 # ── Router ───────────────────────────────────────────────────────────────────
@@ -347,8 +641,8 @@ def handler(event, context):
         if path.startswith("/blocked-ips/") and method == "DELETE":
             ip = path_params.get("ip") or path.split("/blocked-ips/", 1)[1]
             ip = urllib.parse.unquote(ip)
-            _unblock_ip(ip, actor="dashboard")
-            return _response(200, {"status": "unblocked", "ip": ip})
+            did = _unblock_ip(ip, actor=_caller_email(event) or "dashboard")
+            return _response(200, {"status": "unblocked" if did else "already-unblocked", "ip": ip})
 
         if path == "/logs" and method == "GET":
             qsp    = event.get("queryStringParameters") or {}
@@ -358,6 +652,9 @@ def handler(event, context):
                 limit = POLL_LIMIT_DEFAULT
             items, cursor, scanned = _get_logs_page(limit, qsp.get("cursor"), qsp.get("q"))
             return _response(200, {"items": items, "cursor": cursor, "scanned": scanned})
+
+        if path == "/users" and method == "POST":
+            return _handle_users(event)
 
         if path == "/telegram/webhook" and method == "POST":
             return _handle_telegram_webhook(event)

@@ -280,6 +280,47 @@ export function isAuthenticated(): Promise<boolean> {
   return getIdToken().then((t) => t !== null)
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+   Role — Cognito group membership
+   ══════════════════════════════════════════════════════════════════════════ */
+
+export type Role = 'admin' | 'operator'
+
+/**
+ * Resolves the caller's role from the `cognito:groups` claim on the ID token.
+ * Membership of the `admin` group unlocks user management (inviting, promoting
+ * and removing operators); everyone else is an operator with full monitoring
+ * and remediation access but no user-management surface.
+ *
+ * This is a UX gate only. The authoritative check lives server-side in the
+ * dashboard Lambda, which re-reads cognito:groups from the API Gateway JWT
+ * authoriser before honouring any user-management call — a token minted for an
+ * operator must be rejected there too, or the UI restriction is trivially
+ * bypassed.
+ */
+export async function getRole(): Promise<Role> {
+  const token = await getIdToken()
+  if (!token) return 'operator'
+  try {
+    const groups = decodeJwtPayload(token)['cognito:groups']
+    return Array.isArray(groups) && groups.includes('admin') ? 'admin' : 'operator'
+  } catch {
+    return 'operator'
+  }
+}
+
+/** The signed-in user's email (from the ID token), lowercased. Empty if
+ *  unavailable. Used to stop an admin from removing or demoting themselves. */
+export async function getEmail(): Promise<string> {
+  const token = await getIdToken()
+  if (!token) return ''
+  try {
+    return String(decodeJwtPayload(token).email ?? '').trim().toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
 /** True when the active session was established through an external IdP. */
 export function isFederatedSession(): boolean {
   return (localStorage.getItem(`${SDK_PREFIX}.LastAuthUser`) ?? '').startsWith('Google_')

@@ -24,9 +24,16 @@ ENABLE_RULES  = True
 FEATURE_COLS  = ["total_requests", "failed_status_rate", "payload_size_variance"]
 
 RULES = [
-    ("failed_status_rate",    0.5,  "High rate of failed HTTP statuses",                     "HIGH"),
-    ("total_requests",        60,   "Elevated request rate",                                  "HIGH"),
-    ("total_requests",        300,  "Severe DDoS Flood",                                      "CRITICAL"),
+    # Brute force is gated on the NUMBER of failed requests in the window, not a
+    # bare failure rate. Rate alone means a single mistyped password (1 of 1
+    # failed = 100%) trips the rule — real users fat-finger credentials, so that
+    # is a false positive. Requiring a minimum count separates "a person having
+    # a bad morning" (a handful) from automated credential stuffing (many).
+    # Both thresholds are tuning knobs; the window is WINDOW_SECONDS (60s).
+    ("failed_count",          5,    "Repeated failed requests",                                  "MEDIUM"),
+    ("failed_count",          15,   "Brute force / credential stuffing",                         "HIGH"),
+    ("total_requests",        60,   "Elevated request rate",                                     "HIGH"),
+    ("total_requests",        300,  "Severe DDoS Flood",                                         "CRITICAL"),
     ("payload_size_variance", 1e10, "High payload size variance (possible fuzzing/exfiltration)", "HIGH"),
 ]
 
@@ -45,7 +52,7 @@ def rule_based_check(features: dict) -> dict | None:
             triggered.append(f"{label} ({col}={val:.2f})")
             if severity_rank[severity] > severity_rank[highest_severity]:
                 highest_severity = severity
-            if "status" in col:
+            if "status" in col or "failed" in col:
                 categories.add("failure")
             if "requests" in col:
                 categories.add("volume")

@@ -163,7 +163,8 @@ def _dashboard_page() -> str:
   <p style="margin-top:14px;color:#a9bdd4">Account balance: RM 148,250.00</p>
   <p style="margin-top:8px;color:#a9bdd4">3 pending transfers &middot; 12 invoices due</p>
   <p style="margin-top:20px"><a href="transactions" style="color:#4db8ff;margin:0 10px">Transactions</a>
-     <a href="profile" style="color:#4db8ff;margin:0 10px">Profile</a></p>
+     <a href="profile" style="color:#4db8ff;margin:0 10px">Profile</a>
+     <a href="." style="color:#ff8f8f;margin:0 10px">Log out</a></p>
 </div></body></html>"""
 
 
@@ -188,7 +189,7 @@ def _page_shell(title: str, body: str) -> str:
   .field b {{ color:#e8eef5; }}
 </style></head>
 <body><div class="box">
-  <div class="nav"><a href="dashboard">&larr; Dashboard</a><a href="transactions">Transactions</a><a href="profile">Profile</a></div>
+  <div class="nav"><a href="dashboard">&larr; Dashboard</a><a href="transactions">Transactions</a><a href="profile">Profile</a><a href="." style="color:#ff8f8f;float:right;margin-right:0">Log out</a></div>
   <h1>{title}</h1>
   {body}
 </div></body></html>"""

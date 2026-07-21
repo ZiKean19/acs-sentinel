@@ -54,9 +54,9 @@
      invisible. Light mode uses darker stops of the same hues, and fills the
      severity pills rather than outlining them — a 1px accent hairline on white
      is too weak to register at a glance. */
-  --sev-critical:#c02434; --sev-high:#b1560a; --sev-medium:#8a6208; --sev-low:#0d7a52;
-  --sev-critical-bg:#fde5e7; --sev-high-bg:#fdedd8; --sev-medium-bg:#fbf2d2; --sev-low-bg:#d9f4e7;
-  --sev-critical-fg:#8f1220; --sev-high-fg:#8a3c0a; --sev-medium-fg:#6f4d05; --sev-low-fg:#0a5238;
+  --sev-critical:#d21f2f; --sev-high:#e0670f; --sev-medium:#c99a06; --sev-low:#0f8a5f;
+  --sev-critical-bg:#fbe0e3; --sev-high-bg:#ffe6cf; --sev-medium-bg:#fdf3bf; --sev-low-bg:#d6f2e6;
+  --sev-critical-fg:#9e1220; --sev-high-fg:#9a4300; --sev-medium-fg:#6b5200; --sev-low-fg:#0a5238;
 
   --sev-unknown:#5f6b7d;
 

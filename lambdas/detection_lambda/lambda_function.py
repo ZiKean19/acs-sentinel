@@ -230,6 +230,7 @@ def extract_features(ip: str, event: dict) -> dict:
     return {
         "ip":                    ip,
         "total_requests":        total_requests,
+        "failed_count":          failed,
         "failed_status_rate":    round(failed_status_rate, 4),
         "payload_size_variance": round(payload_size_variance, 2),
         "geo_anomaly":           0 if is_malaysian_ip(ip) else 1,
@@ -238,19 +239,19 @@ def extract_features(ip: str, event: dict) -> dict:
 
 def _classify_threat(features: dict, severity_hint: str = None) -> str:
     total_requests        = features.get("total_requests", 0)
-    failed_status_rate    = features.get("failed_status_rate", 0)
+    failed_count          = features.get("failed_count", 0)
     payload_size_variance = features.get("payload_size_variance", 0)
     geo_anomaly           = features.get("geo_anomaly", 0)
 
     if total_requests >= 300:
         return "DDoS Flood Attack"
-    if failed_status_rate >= 0.5:
+    if failed_count >= 15:
         return "Brute Force / Scan Probe"
     if payload_size_variance >= 1e10:
         return "Payload Injection / Fuzzing"
     if total_requests >= 60:
         return "Rate Limit Violation"
-    if geo_anomaly == 1 and failed_status_rate >= 0.2:
+    if geo_anomaly == 1 and failed_count >= 5:
         return "Foreign Scanner Anomaly"
     return "Traffic Pattern Anomaly"
 
