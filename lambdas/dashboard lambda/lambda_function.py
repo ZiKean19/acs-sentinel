@@ -50,6 +50,10 @@ LOGS_GSI        = os.environ.get("LOGS_GSI", "by-time")
 WAF_IPSET_ID    = os.environ.get("WAF_IPSET_ID", "")
 WAF_IPSET_NAME  = os.environ.get("WAF_IPSET_NAME", "acs-blocked-ips")
 WAF_IPSET_SCOPE = os.environ.get("WAF_IPSET_SCOPE", "REGIONAL")
+# Second enforcement point for the agentless edge path. CLOUDFRONT-scope
+# resources are only addressable via us-east-1, whatever region this runs in.
+WAF_IPSET_ID_CF   = os.environ.get("WAF_IPSET_ID_CF", "")
+WAF_IPSET_NAME_CF = os.environ.get("WAF_IPSET_NAME_CF", "acs-blocked-ips-cf")
 
 # User management (admin-only). The allowlist table is the same one the
 # PreSignUp trigger reads; role changes are enforced through Cognito group
@@ -71,6 +75,7 @@ SEARCH_QUERY_PAGES = 8        # DynamoDB pages walked per search request
 
 dynamo  = boto3.client("dynamodb", region_name=AWS_REGION)
 wafv2   = boto3.client("wafv2", region_name=AWS_REGION)
+wafv2_cf = boto3.client("wafv2", region_name="us-east-1")
 cognito = boto3.client("cognito-idp", region_name=AWS_REGION)
 
 CORS_HEADERS = {
@@ -168,12 +173,33 @@ def _matches(entry: dict, needle: str) -> bool:
     return needle in hay
 
 
-def _query_logs_page(limit, cursor, q):
-    """Time-ordered page via the by-time GSI. Raises if the index is missing."""
+def _query_logs_page(limit, cursor, q, since=None, until=None):
+    """Time-ordered page via the by-time GSI. Raises if the index is missing.
+
+    `since`/`until` (ISO-8601 strings) bound the sort key so the GSI reads ONLY
+    rows in that window — the cheap way to answer "show me the last few days"
+    instead of paging back through everything. ISO timestamps sort
+    lexicographically, so a string BETWEEN is a correct time range."""
     needle = (q or "").strip().lower()
     lek    = _decode_cursor(cursor)
     items: list = []
     scanned = 0
+
+    # Sort-key range on the GSI's `timestamp` range key. Aliased via
+    # ExpressionAttributeNames because `timestamp` is a DynamoDB reserved word.
+    key_expr = "gsi_pk = :p"
+    values   = {":p": {"S": GSI_PK}}
+    names    = None
+    if since and until:
+        key_expr += " AND #ts BETWEEN :from AND :to"
+        values[":from"] = {"S": since}; values[":to"] = {"S": until}
+        names = {"#ts": "timestamp"}
+    elif since:
+        key_expr += " AND #ts >= :from"
+        values[":from"] = {"S": since}; names = {"#ts": "timestamp"}
+    elif until:
+        key_expr += " AND #ts <= :to"
+        values[":to"] = {"S": until}; names = {"#ts": "timestamp"}
 
     # Plain paging reads exactly one page sized to the limit. A search walks
     # up to SEARCH_QUERY_PAGES pages per request so one Lambda call does a
@@ -185,11 +211,13 @@ def _query_logs_page(limit, cursor, q):
         kwargs = {
             "TableName":                 LOGSTREAM_TABLE,
             "IndexName":                 LOGS_GSI,
-            "KeyConditionExpression":    "gsi_pk = :p",
-            "ExpressionAttributeValues": {":p": {"S": GSI_PK}},
+            "KeyConditionExpression":    key_expr,
+            "ExpressionAttributeValues": values,
             "ScanIndexForward":          False,   # newest first
             "Limit":                     page_limit,
         }
+        if names:
+            kwargs["ExpressionAttributeNames"] = names
         if lek:
             kwargs["ExclusiveStartKey"] = lek
         resp  = dynamo.query(**kwargs)
@@ -205,7 +233,7 @@ def _query_logs_page(limit, cursor, q):
     return items, _encode_cursor(lek), scanned
 
 
-def _scan_logs_page(limit, cursor, q):
+def _scan_logs_page(limit, cursor, q, since=None, until=None):
     """
     Legacy fallback for before the by-time GSI exists. Scan order is not time
     order, so each page is sorted for display but "older" pages may interleave;
@@ -221,35 +249,59 @@ def _scan_logs_page(limit, cursor, q):
     scanned = len(items)
     if needle:
         items = [e for e in items if _matches(e, needle)]
+    if since:
+        items = [e for e in items if e["timestamp"] >= since]
+    if until:
+        items = [e for e in items if e["timestamp"] <= until]
     items.sort(key=lambda x: x["timestamp"], reverse=True)
     return items, _encode_cursor(resp.get("LastEvaluatedKey")), scanned
 
 
-def _get_logs_page(limit, cursor, q):
+def _get_logs_page(limit, cursor, q, since=None, until=None):
     limit = max(1, min(limit, PAGE_LIMIT_MAX))
     try:
-        return _query_logs_page(limit, cursor, q)
+        return _query_logs_page(limit, cursor, q, since, until)
     except Exception as exc:
         # Most likely: GSI not created yet (ValidationException). Fall back
         # rather than blank the dashboard, and say so in the logs.
         print(f"[WARN] by-time GSI query failed ({exc}) — falling back to Scan")
-        return _scan_logs_page(limit, cursor, q)
+        return _scan_logs_page(limit, cursor, q, since, until)
 
 
 # ── Unblock (shared by dashboard DELETE and Telegram button) ─────────────────
 
-def _remove_from_waf(ip: str):
-    if not WAF_IPSET_ID:
-        return
+def _remove_from_one_set(client, name: str, scope: str, ipset_id: str, ip: str) -> bool:
     try:
-        resp = wafv2.get_ip_set(Name=WAF_IPSET_NAME, Scope=WAF_IPSET_SCOPE, Id=WAF_IPSET_ID)
+        resp = client.get_ip_set(Name=name, Scope=scope, Id=ipset_id)
         addresses = [a for a in resp["IPSet"]["Addresses"] if a != f"{ip}/32"]
-        wafv2.update_ip_set(
-            Name=WAF_IPSET_NAME, Scope=WAF_IPSET_SCOPE, Id=WAF_IPSET_ID,
+        client.update_ip_set(
+            Name=name, Scope=scope, Id=ipset_id,
             Addresses=addresses, LockToken=resp["LockToken"],
         )
+        return True
     except Exception as exc:
-        print(f"[WARN] WAF removal failed: {exc}")
+        print(f"[WARN] WAF removal failed ({scope}/{name}): {exc}")
+        return False
+
+
+def _remove_from_waf(ip: str):
+    """
+    Lift the block at every enforcement point.
+
+    An unblock that clears only one set is worse than no unblock at all: the
+    operator is told the address is released, the dashboard shows it released,
+    and the visitor still gets a 403 from whichever edge was missed. Both sets
+    are therefore attempted independently, and each outcome is logged.
+    """
+    targets = []
+    if WAF_IPSET_ID:
+        targets.append((wafv2, WAF_IPSET_NAME, WAF_IPSET_SCOPE, WAF_IPSET_ID))
+    if WAF_IPSET_ID_CF:
+        targets.append((wafv2_cf, WAF_IPSET_NAME_CF, "CLOUDFRONT", WAF_IPSET_ID_CF))
+
+    for client, name, scope, ipset_id in targets:
+        ok = _remove_from_one_set(client, name, scope, ipset_id, ip)
+        print(f"[WAF] unblock {ip} -> {scope}/{name}: {'ok' if ok else 'FAILED'}")
 
 
 def _unblock_ip(ip: str, actor: str = "dashboard") -> bool:
@@ -650,7 +702,10 @@ def handler(event, context):
                 limit = int(qsp.get("limit", POLL_LIMIT_DEFAULT))
             except (TypeError, ValueError):
                 limit = POLL_LIMIT_DEFAULT
-            items, cursor, scanned = _get_logs_page(limit, qsp.get("cursor"), qsp.get("q"))
+            items, cursor, scanned = _get_logs_page(
+                limit, qsp.get("cursor"), qsp.get("q"),
+                since=qsp.get("from"), until=qsp.get("to"),
+            )
             return _response(200, {"items": items, "cursor": cursor, "scanned": scanned})
 
         if path == "/users" and method == "POST":

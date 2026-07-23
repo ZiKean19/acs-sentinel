@@ -68,13 +68,15 @@ AWS_REGION       = "ap-southeast-1"
 # scenario gets its OWN detection window (no cross-contamination). This lets
 # every severity tier be demonstrated simultaneously on the dashboard.
 SCENARIO_IPS = {
-    "low":        "175.136.50.10",    # Malaysian, mild anomaly    -> LOW (ML)
-    "medium":     "175.136.55.15",    # Malaysian, moderate anomaly-> MEDIUM (ML)
-    "stealth":    "203.0.113.45",     # Foreign, low-and-slow      -> HIGH (ML + geo)
-    "scan":       "45.33.32.156",     # Foreign, path scanning     -> HIGH (rule, 404s)
-    "bruteforce": "198.51.100.77",    # Foreign, high failure rate -> HIGH (rule)
-    "flood":      "192.0.2.88",       # Foreign, high volume       -> CRITICAL (rule)
-    "normal":     "175.136.60.20",    # Malaysian, benign          -> no alert
+    # Local Malaysian IPs are the main act (geo_anomaly=0). Foreign is a minor
+    # cameo (scan) to show the geo feature — not the focus.
+    "low":        "175.136.50.10",    # Malaysian, mild anomaly     -> LOW (ML)
+    "medium":     "175.136.55.15",    # Malaysian, moderate anomaly -> MEDIUM (ML)
+    "stealth":    "175.136.58.22",    # Malaysian, low-and-slow     -> ML only (no rule)
+    "scan":       "45.33.32.156",     # Foreign, path scanning      -> rule (cameo)
+    "bruteforce": "175.136.70.30",    # Malaysian, many failures    -> HIGH (rule)
+    "flood":      "175.136.80.40",    # Malaysian, high volume      -> CRITICAL (rule)
+    "normal":     "175.136.60.20",    # Malaysian, benign           -> no alert
 }
 # A Malaysian IP used by the low scenario's direct Lambda invoke.
 MALAYSIAN_IP     = SCENARIO_IPS["low"]
@@ -137,17 +139,22 @@ def attack_flood(base_url: str, n: int = 350):
     _summarise(codes)
 
 
-def attack_stealth(base_url: str, total: int = 40, fail_ratio: float = 0.35):
+def attack_stealth(base_url: str, total: int = 45, n_fail: int = 3):
     """
-    Low-and-slow mixed traffic that stays UNDER the rule thresholds
-    (< 60 requests, < 50% failure) so only the Isolation Forest flags it.
+    Low-and-slow traffic from a LOCAL Malaysian IP that stays UNDER every rule
+    threshold — under 60 requests AND fewer than 5 failed attempts — so the
+    rule engine stays silent and only the Isolation Forest can flag it. This is
+    the scenario that shows the ML earning its place.
+
+    (Real-time tier varies because the ~60s CloudWatch window batches
+    non-deterministically; for a deterministic ML severity ladder use
+    demo_detection.py, which reads back the engine's exact score.)
     """
-    n_fail = int(total * fail_ratio)
-    n_ok = total - n_fail
+    n_ok = max(total - n_fail, 0)
     xff = SCENARIO_IPS["stealth"]
-    print(f"[stealth] Sending {total} mixed requests from {xff} "
-          f"({n_ok} valid, {n_fail} failed, ~{int(fail_ratio*100)}% failure) ...")
-    print("   (stays under rule thresholds -> caught by ML/Isolation Forest, NOT rules)")
+    print(f"[stealth] Sending {total} mixed requests from {xff} (local) "
+          f"({n_ok} valid, {n_fail} failed) ...")
+    print("   (under rule thresholds: <60 req, <5 fails -> caught by ML only, not rules)")
     codes = []
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = []

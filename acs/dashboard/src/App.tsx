@@ -3,6 +3,7 @@ import {
   Shield, ShieldCheck, Activity, Ban, Bell, Terminal, LogOut, Sun, Moon,
   RefreshCw, X, Search, AlertTriangle, AlertCircle, MinusCircle,
   CheckCircle2, History, Wifi, WifiOff, Inbox, Download, Users, UserPlus, Trash2,
+  ChevronsLeft, ExternalLink, ChevronDown,
 } from 'lucide-react'
 import {
   ComposedChart, Area, Scatter, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, CartesianGrid,
@@ -132,11 +133,15 @@ const RISK_TICKS = [0, 25, 50, 75, 100]
 
 /** Selectable chart windows. Ticks show seconds only where a tick interval is
  *  short enough for seconds to differ between neighbouring ticks. */
+// Windows stop at 3 days because that is as far back as the data goes: alerts
+// carry a severity-proportional TTL topping out at 72 h (CRITICAL), so a longer
+// span would query a range DynamoDB has already expired and render an empty
+// stretch. Four steps rather than six — each is a meaningful jump.
 const CHART_WINDOWS = [
-  { label: 'Last 15 min', ms: 15 * 60_000, secTicks: true },
-  { label: 'Last hour', ms: 60 * 60_000, secTicks: false },
-  { label: 'Last 6 hours', ms: 6 * 3_600_000, secTicks: false },
-  { label: 'Last 24 hours', ms: 24 * 3_600_000, secTicks: false },
+  { label: 'Last 15 min', ms: 15 * 60_000, secTicks: true, days: false },
+  { label: 'Last hour', ms: 60 * 60_000, secTicks: false, days: false },
+  { label: 'Last 24 hours', ms: 24 * 3_600_000, secTicks: false, days: false },
+  { label: 'Last 3 days', ms: 3 * 86_400_000, secTicks: false, days: true },
 ]
 
 /** A ticking clock for "x seconds ago" copy and draining TTL bars. One shared
@@ -179,6 +184,9 @@ function formatClock(t: number): string {
 }
 function formatClockSec(t: number): string {
   return new Date(t).toLocaleTimeString('en-MY', { timeZone: MYT, hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+function formatDay(t: number): string {
+  return new Date(t).toLocaleDateString('en-MY', { timeZone: MYT, month: 'short', day: 'numeric' })
 }
 /** Minus sign (U+2212) rather than hyphen: aligns with tabular figures. */
 const num = (n: number, dp = 4) => n.toFixed(dp).replace('-', '−')
@@ -555,11 +563,11 @@ function StatusBand({ alerts, blockedIPs, logs, anyError, connected }: {
     sub = 'What you see below may be out of date. Blocking rules already in AWS WAF stay active regardless. Retrying automatically every 4 seconds.'
   } else if (lastHour.length > 0) {
     tone = 'active'
-    lead = 'You’re covered.'
-    highlight = `${lastHour.length} ${plural(lastHour.length, 'threat was', 'threats were')} handled in the last hour.`
+    lead = 'Handled automatically.'
+    highlight = `${lastHour.length} ${plural(lastHour.length, 'threat was', 'threats were')} blocked in the last hour.`
     sub = blockedIPs.length > 0
-      ? `Nothing needs your attention — Sentinel blocked ${plural(blockedIPs.length, 'the source', 'each source')} automatically. ${longestBlock ? `The longest block lifts in ${longestBlock}.` : 'Blocks lift on their own.'} Open Blocked IPs to unblock early.`
-      : 'These were logged for monitoring only and did not meet the threshold for an automatic block.'
+      ? `No action needed — Sentinel blocked ${plural(blockedIPs.length, 'the source', 'each source')} at the WAF. ${longestBlock ? `Blocks lift on their own; the longest has ${longestBlock} left.` : 'Blocks lift on their own.'} If one was a legitimate visitor, you can release it under Blocked IPs.`
+      : 'No source is blocked right now — earlier blocks have already lifted, or these were logged for monitoring only.'
   }
 
   // ── Heartbeat (absorbed from the retired RiskMeter panel) ────────────────
@@ -596,21 +604,13 @@ function StatusBand({ alerts, blockedIPs, logs, anyError, connected }: {
   // and the copy says quiet, so the dot can't vouch for a dead pipeline.
   const isFresh = sinceLast !== null && sinceLast < FRESH_MS
 
-  // The band colour claims something about RIGHT NOW, so it has to age out on
-  // the SCORE's clock — not on `isFresh`, which any unscored line satisfies.
-  // Those two clocks were decoupled, and the gap was not hypothetical: rule
-  // hits are written with score −1.0 (SCORE_SEVERE pegs every rule score at
-  // 100%), so one rule hit stayed the newest *scored* line indefinitely while
-  // ordinary traffic kept the heartbeat alive. The alert aged past the hour and
-  // the verdict went green, but the dot held red on a reading nobody had taken
-  // since. A stale maximum is the worst possible thing to leave asserted.
-  const scoreAge = latest !== null ? nowMs - latest.ts : null
-  const riskPct = score !== null && scoreAge !== null && scoreAge < FRESH_MS
-    ? riskPercentFor(score)
-    : null
-  const dotClass = !connected || !isFresh ? 'idle'
-    : riskPct !== null && riskPct >= BAND_ACT ? 'b-act'
-      : riskPct !== null && riskPct >= BAND_WATCH ? 'b-watch'
+  // The dot now agrees with the verdict beside it: amber when the last-hour
+  // verdict is "threats handled", grey when we can't vouch (disconnected, or
+  // the stream has gone quiet), green when calm and fresh. Colouring it off a
+  // stale max score was what left an orange verdict sitting next to a grey dot.
+  const dotClass = anyError || !connected ? 'idle'
+    : tone === 'active' ? 'b-watch'
+      : !isFresh ? 'idle'
         : ''
 
   // In the calm state the static explainer gives way to live evidence — the
@@ -739,6 +739,32 @@ function AnomalyChart({ logs, alerts, onRunSim }: { logs: LogEntry[], alerts: Al
   const [traffic, setTraffic] = useState<TrafficFilter>('all')
   const win = CHART_WINDOWS[winIdx]
 
+  // Multi-day windows need more than the live poll's ~300 lines. Pull a bounded
+  // slice of history for the selected span (server-side range via `from` once
+  // the Lambda supports it; otherwise it pages back and stops at the cap here).
+  // Sub-day windows are fully covered by the live stream, so we skip the fetch.
+  const [history, setHistory] = useState<LogEntry[]>([])
+  useEffect(() => {
+    if (!win.days) { setHistory([]); return }
+    let cancelled = false
+    ;(async () => {
+      try {
+        const from = new Date(Date.now() - win.ms).toISOString()
+        let items: LogEntry[] = []
+        let c: string | null | undefined = undefined
+        for (let g = 0; g < 8 && items.length < 2000; g++) {
+          const page = await fetchLogPage({ from, cursor: c ?? undefined, limit: 400 })
+          if (cancelled) return
+          items = items.concat(page.items)
+          c = page.cursor
+          if (!c) break
+        }
+        if (!cancelled) setHistory(items)
+      } catch { if (!cancelled) setHistory([]) }
+    })()
+    return () => { cancelled = true }
+  }, [win.days, win.ms])
+
   const { data, counts, domainX, scoredCount, mode } = useMemo(() => {
     const end = Date.now()
     const start = end - win.ms
@@ -767,7 +793,10 @@ function AnomalyChart({ logs, alerts, onRunSim }: { logs: LogEntry[], alerts: Al
     // anomalous rows (INFO otherwise), so anomaly dots can colour by severity
     // instead of falling back to the grey "unknown".
     const SEVS = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
-    const fromLogs = collect(logs, l => l.message, l => (SEVS.includes(l.level) ? l.level : undefined as any))
+    const srcLogs = history.length
+      ? [...new Map([...history, ...logs].map(l => [l.log_id || `${l.timestamp}-${l.message}`, l])).values()]
+      : logs
+    const fromLogs = collect(srcLogs, l => l.message, l => (SEVS.includes(l.level) ? l.level : undefined as any))
     const usingLogs = fromLogs.length > 0
     const rows = usingLogs
       ? fromLogs
@@ -800,7 +829,7 @@ function AnomalyChart({ logs, alerts, onRunSim }: { logs: LogEntry[], alerts: Al
       scoredCount: rows.length,
       mode: (usingLogs ? 'baseline' : 'detections') as 'baseline' | 'detections',
     }
-  }, [logs, alerts, win.ms, traffic])
+  }, [logs, alerts, win.ms, traffic, history])
 
   const chartColumns: Col<ChartPoint>[] = [
     { label: 'Timestamp (UTC)', value: p => new Date(p.time).toISOString() },
@@ -910,7 +939,8 @@ function AnomalyChart({ logs, alerts, onRunSim }: { logs: LogEntry[], alerts: Al
             </defs>
             <CartesianGrid stroke="var(--chart-grid)" vertical={false} />
             <XAxis dataKey="time" type="number" domain={domainX} scale="time"
-              tickFormatter={win.secTicks ? formatClockSec : formatClock}
+              tickFormatter={win.days ? formatDay : (win.secTicks ? formatClockSec : formatClock)}
+              minTickGap={50} interval="preserveStartEnd"
               axisLine={false} tickLine={false}
               tick={{ fill: 'var(--chart-tick)', fontSize: 12, fontFamily: 'IBM Plex Mono' } as any} />
             <YAxis width={46} axisLine={false} tickLine={false}
@@ -982,12 +1012,12 @@ function AnomalyChart({ logs, alerts, onRunSim }: { logs: LogEntry[], alerts: Al
    Alert list + threat report
    ══════════════════════════════════════════════════════════════════════════ */
 
-function AlertList({ alerts, loading, onSelect }: {
-  alerts: Alert[], loading: boolean, onSelect: (a: Alert) => void
+function AlertList({ alerts, loading, onSelect, limit = 50 }: {
+  alerts: Alert[], loading: boolean, onSelect: (a: Alert) => void, limit?: number
 }) {
   const sorted = useMemo(
-    () => [...alerts].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || '')).slice(0, 50),
-    [alerts],
+    () => [...alerts].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || '')).slice(0, limit),
+    [alerts, limit],
   )
 
   if (loading && alerts.length === 0) return <Spinner label="Loading alerts…" />
@@ -1026,12 +1056,148 @@ function AlertList({ alerts, loading, onSelect }: {
   )
 }
 
-function ThreatReport({ alert, onClose, onUnblock }: {
-  alert: Alert, onClose: () => void, onUnblock: (ip: string) => void
+/* ══════════════════════════════════════════════════════════════════════════
+   Alerts page — the full, searchable list (Overview shows only the latest few)
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const SEV_RANK: Record<string, number> = { LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4 }
+
+function AlertsPanel({ alerts, loading, onSelect, onRefresh }: {
+  alerts: Alert[], loading: boolean, onSelect: (a: Alert) => void, onRefresh: () => void
+}) {
+  const [q, setQ] = useState('')
+  // Grouped by default. A sustained attack writes one alert per detection
+  // window, so a flat list repeats the same address a dozen times at drifting
+  // severities — noise that also made this page look like a second copy of the
+  // blocklist. Grouping reframes it as what it actually is: a per-source
+  // history. The blocklist answers "who is blocked right now"; this answers
+  // "what has this address been doing". Chronological stays one click away for
+  // anyone who needs the raw sequence.
+  const [grouped, setGrouped] = useState(true)
+  const [open, setOpen] = useState<Set<string>>(new Set())
+  const toggle = (ip: string) => setOpen(prev => {
+    const next = new Set(prev); next.has(ip) ? next.delete(ip) : next.add(ip); return next
+  })
+
+  const filtered = useMemo(() => {
+    const n = q.toLowerCase().trim()
+    return alerts.filter(a => !n || `${a.source_ip} ${a.type} ${a.reason} ${a.severity}`.toLowerCase().includes(n))
+  }, [alerts, q])
+  const sorted = useMemo(
+    () => [...filtered].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || '')),
+    [filtered],
+  )
+
+  const groups = useMemo(() => {
+    const byIp = new Map<string, Alert[]>()
+    for (const a of sorted) {
+      const list = byIp.get(a.source_ip)
+      if (list) list.push(a); else byIp.set(a.source_ip, [a])
+    }
+    return [...byIp.entries()].map(([ip, items]) => {
+      const worst = items.reduce((w, a) => (SEV_RANK[a.severity] ?? 0) > (SEV_RANK[w] ?? 0) ? a.severity : w, 'LOW')
+      const types = [...new Set(items.map(a => a.type).filter(Boolean))]
+      return {
+        ip, items, worst, types,
+        latest: items[0],
+        first: items[items.length - 1],
+        geo: items[0]?.geo_anomaly,
+      }
+    }).sort((a, b) => (b.latest.timestamp || '').localeCompare(a.latest.timestamp || ''))
+  }, [sorted])
+
+  return (
+    <div className="card">
+      <div className="toolbar">
+        <SearchBox value={q} onChange={setQ} placeholder="Filter by address, type or reason" />
+        <span className="count">
+          {grouped
+            ? `${groups.length} ${plural(groups.length, 'source', 'sources')} · ${filtered.length} ${plural(filtered.length, 'alert', 'alerts')}`
+            : `${filtered.length} of ${alerts.length}`}
+        </span>
+        <div className="seg" role="group" aria-label="Alert grouping">
+          <button aria-pressed={grouped} onClick={() => setGrouped(true)}>By source</button>
+          <button aria-pressed={!grouped} onClick={() => setGrouped(false)}>Chronological</button>
+        </div>
+        <ExportMenu name={q ? 'alerts-filtered' : 'alerts'} rows={sorted} columns={ALERT_COLUMNS} />
+        <button className="btn sm ghost" onClick={onRefresh} title="Refresh alerts">
+          <RefreshCw size={13} />Refresh
+        </button>
+      </div>
+
+      {!grouped && <AlertList alerts={filtered} loading={loading} onSelect={onSelect} limit={200} />}
+
+      {grouped && (
+        loading && alerts.length === 0 ? <Spinner label="Loading alerts…" />
+          : groups.length === 0 ? (
+            <EmptyState icon={<ShieldCheck size={22} />} title="No alerts"
+              body="Nothing has crossed the detection threshold. This is the state you want." />
+          ) : (
+            <div>
+              {groups.map(g => {
+                const isOpen = open.has(g.ip)
+                return (
+                  <div key={g.ip}>
+                    <button className={`row r-${sevKey(g.worst)}`} onClick={() => toggle(g.ip)}
+                      aria-expanded={isOpen}
+                      title={isOpen ? 'Collapse this source' : 'Expand to see each detection'}>
+                      <span className="cell-sev"><SeverityPill severity={g.worst} /></span>
+                      <span className="cell-ip truncate"><IpCell ip={g.ip} geoAnomaly={g.geo} /></span>
+                      <span className="grow">
+                        <span className="what">{g.types.slice(0, 2).join(' · ') || 'Detection'}</span>
+                        <div className="why truncate">
+                          {g.items.length} {plural(g.items.length, 'detection', 'detections')}
+                          {g.items.length > 1 && ` · first seen ${formatTime(g.first.timestamp)}`}
+                          {` · ${g.latest.reason}`}
+                        </div>
+                      </span>
+                      <span className="when hide-sm">{g.items.length}×</span>
+                      <span className="when">{formatTime(g.latest.timestamp)}</span>
+                      <ChevronDown size={15} aria-hidden="true"
+                        style={{ flexShrink: 0, opacity: 0.55, transform: isOpen ? 'rotate(180deg)' : 'none', transition: 'transform .15s ease' }} />
+                    </button>
+                    {isOpen && (
+                      <div style={{ paddingLeft: 18 }}>
+                        <AlertList alerts={g.items} loading={false} onSelect={onSelect} limit={100} />
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )
+      )}
+    </div>
+  )
+}
+
+function ThreatReport({ alert, block, onClose, onUnblock }: {
+  alert: Alert, block: BlockedIP | null, onClose: () => void, onUnblock: (ip: string) => void
 }) {
   const closeRef = useRef<HTMLButtonElement>(null)
+  const [justUnblocked, setJustUnblocked] = useState(false)
+  // Live block state: the parent's block list, minus an unblock we just issued
+  // (so the button flips the instant it's clicked, ahead of the next poll).
+  const isBlocked = !!block && !justUnblocked
+  const nowSec = useNowMs(1000) / 1000
+  // Blocks are temporary and lift on their own, so the report states WHEN
+  // rather than just THAT — otherwise the only visible way out looks like the
+  // unblock button, which invites releasing an attacker that would have
+  // expired by itself.
+  const ttlLabel = useMemo(() => {
+    if (!block?.ttl) return null
+    const left = Math.max(0, block.ttl - nowSec)
+    if (left <= 0) return 'expiring now'
+    const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60)
+    return h > 0 ? `${h}h ${m}m` : `${m}m`
+  }, [block, nowSec])
   const foreign = Number(alert.geo_anomaly) === 1 || (alert.geo_anomaly as any) === true || (alert.geo_anomaly as any) === 'true'
   const isML = (alert.method || '').toUpperCase().includes('ML') || (alert.method || '').toLowerCase().includes('isolation')
+
+  const handleUnblockClick = () => {
+    onUnblock(alert.source_ip)
+    setJustUnblocked(true)
+  }
 
   useEffect(() => {
     closeRef.current?.focus()
@@ -1072,6 +1238,14 @@ function ThreatReport({ alert, onClose, onUnblock }: {
             <dt>Detected by</dt>
             <dd>{isML ? 'Isolation Forest' : alert.method || 'Rule engine'}</dd>
           </div>
+          <div className="fact">
+            <dt>Current status</dt>
+            <dd>{isBlocked ? 'Blocked in AWS WAF' : 'Not currently blocked'}</dd>
+          </div>
+          <div className="fact">
+            <dt>Block lifts in</dt>
+            <dd>{isBlocked ? (ttlLabel ?? 'on expiry') : '—'}</dd>
+          </div>
         </dl>
 
         <div className="modal-body">
@@ -1087,9 +1261,15 @@ function ThreatReport({ alert, onClose, onUnblock }: {
 
         <div className="modal-foot">
           <button className="btn" onClick={onClose}>Close</button>
-          <button className="btn primary" onClick={() => { onUnblock(alert.source_ip); onClose() }}>
-            Unblock this address
-          </button>
+          {isBlocked ? (
+            <button className="btn primary" onClick={handleUnblockClick}>
+              Unblock this address
+            </button>
+          ) : (
+            <button className="btn" disabled title="This address is not on the block list">
+              {justUnblocked ? 'Unblocked ✓' : 'Not currently blocked'}
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -1318,12 +1498,33 @@ function BlocklistPanel({ ips, logs, loading, error, onUnblock, onRefresh }: {
       .sort((a, b) => (b.blocked_at || '').localeCompare(a.blocked_at || ''))
   }, [ips, q])
 
-  const auditLogs = useMemo(
-    () => logs.filter(l => l.level === 'AUDIT')
+  // Remediation history must be DURABLE, not a slice of the live window. The
+  // 4-second poll only holds the newest ~300 rows, so a fresh unblock's AUDIT
+  // line drops off the view as soon as 300 newer log rows arrive — which read
+  // as "remediation never updates". So we ALSO pull unblock audit rows
+  // server-side (they persist across polls) and merge them with any live AUDIT
+  // rows for immediate feedback. Re-runs whenever the block list changes.
+  const [remediation, setRemediation] = useState<LogEntry[]>([])
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const page = await fetchLogPage({ q: 'UNBLOCKED', limit: 100 })
+        if (!cancelled) setRemediation(page.items)
+      } catch { /* keep whatever we already have */ }
+    })()
+    return () => { cancelled = true }
+  }, [ips])
+
+  const auditLogs = useMemo(() => {
+    const byId = new Map<string, LogEntry>()
+    for (const l of [...remediation, ...logs.filter(l => l.level === 'AUDIT')]) {
+      byId.set(l.log_id || `${l.timestamp}-${l.message}`, l)
+    }
+    return [...byId.values()]
       .sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''))
-      .slice(0, 50),
-    [logs],
-  )
+      .slice(0, 50)
+  }, [logs, remediation])
 
   const expiringSoon = sortedIPs.filter(i => i.ttl && i.ttl - now > 0 && i.ttl - now < 600).length
 
@@ -1452,18 +1653,20 @@ function BlocklistPanel({ ips, logs, loading, error, onUnblock, onRefresh }: {
    Critical notification
    ══════════════════════════════════════════════════════════════════════════ */
 
-function CriticalToast({ alert, total, onView, onDismiss }: {
-  alert: Alert, total: number, onView: () => void, onDismiss: () => void
+function CriticalToast({ alert, total, index, remaining, onView, onDismiss, onDismissAll }: {
+  alert: Alert, total: number, index: number, remaining: number,
+  onView: () => void, onDismiss: () => void, onDismissAll: () => void
 }) {
   return (
-    <div className="toast" role="alert" aria-live="assertive">
+    <div className="toast" role="status" aria-live="polite">
       <div className="toast-head">
-        <AlertTriangle size={16} strokeWidth={2.2} aria-hidden="true" />
-        Critical threat blocked
-        {total > 1 && <span className="count" style={{ color: 'inherit' }}>{total} total</span>}
+        <ShieldCheck size={16} strokeWidth={2.2} aria-hidden="true" />
+        Threat blocked automatically
+        {total > 1 && <span className="count" style={{ color: 'inherit' }}>{index} of {total}</span>}
         <div className="spacer" />
         <button className="btn ghost sm" onClick={onDismiss}
-          aria-label="Dismiss notification" title="Dismiss"
+          aria-label={remaining > 1 ? 'Dismiss this notification and show the next' : 'Dismiss notification'}
+          title={remaining > 1 ? 'Dismiss this one' : 'Dismiss'}
           style={{ color: 'inherit', margin: '-3px -5px' }}>
           <X size={14} />
         </button>
@@ -1472,11 +1675,15 @@ function CriticalToast({ alert, total, onView, onDismiss }: {
         <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 3 }}>{alert.type}</div>
         <IpCell ip={alert.source_ip} geoAnomaly={alert.geo_anomaly} />
         <p style={{ fontSize: 12.5, color: 'var(--text-2)', marginTop: 9 }}>
-          Blocked automatically at the WAF. No action needed from you.
+          Sentinel blocked this at the WAF automatically — nothing to do. Open it only if you think it’s a false positive and want to unblock.
         </p>
         <div className="toast-actions">
-          <button className="btn primary" onClick={onView}>View report</button>
-          <button className="btn" onClick={onDismiss}>Dismiss</button>
+          <button className="btn primary" onClick={onView}>Review</button>
+          <button className="btn" onClick={onDismiss}>{remaining > 1 ? 'Next' : 'Dismiss'}</button>
+          {remaining > 1 && (
+            <button className="btn ghost" onClick={onDismissAll}
+              title="Dismiss every remaining notification">Dismiss all ({remaining})</button>
+          )}
         </div>
       </div>
     </div>
@@ -1685,15 +1892,39 @@ function DashboardView({ onLogout, theme, toggleTheme, role }: { onLogout: () =>
   const ipsError = blockedStatus === 'error'
   const logsError = logsStatus === 'error'
 
-  const [tab, setTab] = useState<'overview' | 'logs' | 'blocklist' | 'users'>('overview')
+  const [tab, setTab] = useState<'overview' | 'alerts' | 'logs' | 'blocklist' | 'users'>('overview')
+  const protectedAppUrl = import.meta.env.VITE_PROTECTED_APP_URL as string | undefined
   const [selectedAlert, setSelectedAlert] = useState<Alert | null>(null)
   // The signed-in admin's own email — used to stop them removing or demoting
   // their own account and locking themselves out.
   const [myEmail, setMyEmail] = useState('')
   useEffect(() => { let c = false; getEmail().then(e => { if (!c) setMyEmail(e) }); return () => { c = true } }, [])
 
-  const handleUnblock = async (ip: string) => { await unblockIP(ip); resetBlocked() }
+  const handleUnblock = async (ip: string) => { await unblockIP(ip); resetBlocked(); resetLogs() }
   const criticalAlerts = (alerts as Alert[]).filter(a => a.severity === 'CRITICAL')
+  // "Active" = the source IP is still on the block list. A critical whose IP has
+  // been unblocked (manually or by TTL) is handled, so it drops out of the
+  // attention signals — the bell, the toast and the sidebar badge — while
+  // staying in the Alerts list as a historical record.
+  const blockedSet = useMemo(() => new Set((blockedIPs as BlockedIP[]).map(b => b.ip)), [blockedIPs])
+  // The interrupting toast and bell stay CRITICAL-only: an interruption should
+  // be reserved for the severity that warrants one. Lower severities are still
+  // threats, but they are visible in the Alerts list rather than shoved forward.
+  // One notification per ADDRESS, not per alert. A source that is blocked,
+  // expires and is caught again — or that escalates in severity — writes a
+  // second alert row, and stepping through "1 of 2" showing the same IP twice
+  // asks the operator to decide the same thing twice. The action they can take
+  // (unblock) is per-address, so the notification is too; the newest alert wins
+  // and the full history stays on the Alerts page.
+  const activeCriticals = useMemo(() => {
+    const byIp = new Map<string, Alert>()
+    for (const a of criticalAlerts) {
+      if (!blockedSet.has(a.source_ip)) continue
+      const prev = byIp.get(a.source_ip)
+      if (!prev || (a.timestamp || '') > (prev.timestamp || '')) byIp.set(a.source_ip, a)
+    }
+    return [...byIp.values()].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''))
+  }, [criticalAlerts, blockedSet])
   const sortedAlerts = useMemo(
     () => [...(alerts as Alert[])].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || '')),
     [alerts],
@@ -1705,16 +1936,36 @@ function DashboardView({ onLogout, theme, toggleTheme, role }: { onLogout: () =>
   // reload re-surfaces anything still outstanding. Silencing a critical
   // security alert permanently with one click would be an anti-pattern.
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set())
-  const activeCritical = criticalAlerts.find(a => !dismissedIds.has(a.alert_id))
-  const dismissCritical = useCallback((id: string) => {
-    setDismissedIds(prev => { const next = new Set(prev); next.add(id); return next })
+  const pendingCriticals = activeCriticals.filter(a => !dismissedIds.has(a.alert_id))
+  const activeCritical = pendingCriticals[0]
+  // "1 of 3" must advance as you step through, so the position is the alert's
+  // index in the WHOLE batch, not in what's left — otherwise dismissing one
+  // just re-renders "1 of 3" with a different alert behind it.
+  const criticalIndex = activeCritical
+    ? activeCriticals.findIndex(a => a.alert_id === activeCritical.alert_id) + 1
+    : 0
+  const dismissCritical = useCallback((...ids: string[]) => {
+    setDismissedIds(prev => { const next = new Set(prev); ids.forEach(id => next.add(id)); return next })
   }, [])
 
-  const TABS = [
-    { id: 'overview' as const, label: 'Overview', icon: Activity },
-    { id: 'logs' as const, label: 'Log stream', icon: Terminal },
-    { id: 'blocklist' as const, label: 'Blocked IPs', icon: Ban, badge: (blockedIPs as BlockedIP[]).length },
-    ...(isAdmin ? [{ id: 'users' as const, label: 'Users', icon: Users }] : []),
+  const [navCollapsed, setNavCollapsed] = useState(false)
+
+  // Grouped sidebar nav. Monitor = the two watch surfaces, Respond = the
+  // remediation surface, Admin = user management (admins only). Same four tab
+  // ids as before — only the presentation moved from a horizontal strip to a
+  // grouped rail.
+  const NAV_GROUPS = [
+    { label: 'Monitor', items: [
+      { id: 'overview' as const, label: 'Overview', icon: Activity },
+      { id: 'alerts' as const, label: 'Alerts', icon: Bell },
+      { id: 'logs' as const, label: 'Log stream', icon: Terminal },
+    ] },
+    { label: 'Respond', items: [
+      { id: 'blocklist' as const, label: 'Blocked IPs', icon: Ban, badge: (blockedIPs as BlockedIP[]).length },
+    ] },
+    ...(isAdmin ? [{ label: 'Admin', items: [
+      { id: 'users' as const, label: 'Users', icon: Users },
+    ] }] : []),
   ]
 
   return (
@@ -1725,11 +1976,11 @@ function DashboardView({ onLogout, theme, toggleTheme, role }: { onLogout: () =>
           <div className="wordmark">ACS Sentinel</div>
           <div className="spacer" />
 
-          {criticalAlerts.length > 0 && dismissedIds.size > 0 && (
+          {activeCriticals.length > 0 && dismissedIds.size > 0 && (
             <button className="btn sm ghost" onClick={() => setDismissedIds(new Set())}
-              title={`Show ${criticalAlerts.length} critical ${plural(criticalAlerts.length, 'alert', 'alerts')}`}
+              title={`Show ${activeCriticals.length} active critical ${plural(activeCriticals.length, 'alert', 'alerts')}`}
               style={{ color: 'var(--sev-critical-fg)' }}>
-              <Bell size={14} />{criticalAlerts.length}
+              <Bell size={14} />{activeCriticals.length}
             </button>
           )}
 
@@ -1740,39 +1991,56 @@ function DashboardView({ onLogout, theme, toggleTheme, role }: { onLogout: () =>
                 : <><RefreshCw size={13} className="spin" aria-hidden="true" />Connecting</>}
           </div>
 
-          <div className="chip hide-sm"
-            title={isAdmin ? 'Administrator — full access including user management' : 'Operator — full monitoring and remediation'}
-            style={isAdmin ? { color: 'var(--brand)', borderColor: 'var(--brand)' } : undefined}>
-            {isAdmin ? <ShieldCheck size={13} aria-hidden="true" /> : <Shield size={13} aria-hidden="true" />}
-            {isAdmin ? 'Admin' : 'Operator'}
-          </div>
-
           <ThemeButton theme={theme} toggleTheme={toggleTheme} />
-          <button className="btn ghost" onClick={onLogout} title="Sign out" aria-label="Sign out">
-            <LogOut size={16} />
-          </button>
+
         </div>
       </header>
 
-      <div className="app">
-        <StatusBand alerts={alerts as Alert[]} blockedIPs={blockedIPs as BlockedIP[]}
-          logs={logs as LogEntry[]} anyError={anyError} connected={connected} />
-
-        <SeverityLedger alerts={alerts as Alert[]} />
-
-        <div className="tabs" role="tablist" aria-label="Dashboard sections">
-          {TABS.map(t => (
-            <button key={t.id} className="tab" role="tab" aria-selected={tab === t.id}
-              onClick={() => setTab(t.id)}>
-              <t.icon size={15} aria-hidden="true" />
-              {t.label}
-              {!!t.badge && t.badge > 0 && <span className="badge">{t.badge}</span>}
-            </button>
+      <div className="shell">
+        <nav className="sidebar" data-collapsed={navCollapsed} aria-label="Dashboard sections">
+          <button className="nav-collapse" onClick={() => setNavCollapsed(v => !v)}
+            aria-label={navCollapsed ? 'Expand sidebar' : 'Collapse sidebar'} aria-expanded={!navCollapsed}
+            title={navCollapsed ? 'Expand' : 'Collapse'}>
+            <ChevronsLeft size={16} aria-hidden="true" />
+          </button>
+          {NAV_GROUPS.map(g => (
+            <div className="nav-group" key={g.label}>
+              <div className="nav-label">{g.label}</div>
+              {g.items.map(it => (
+                <button key={it.id} className="nav-item" aria-current={tab === it.id ? 'page' : undefined}
+                  onClick={() => setTab(it.id)} title={('hint' in it && it.hint) ? it.hint : it.label}>
+                  <it.icon size={16} aria-hidden="true" />
+                  <span className="nav-text">{it.label}</span>
+                  {'badge' in it && !!it.badge && it.badge > 0 && <span className="nav-badge">{it.badge}</span>}
+                </button>
+              ))}
+            </div>
           ))}
-        </div>
 
+          <div className="nav-foot">
+            {protectedAppUrl && (
+              <a className="nav-item" href={protectedAppUrl} target="_blank" rel="noreferrer"
+                title="Open the protected application">
+                <ExternalLink size={16} aria-hidden="true" />
+                <span className="nav-text">Protected app</span>
+              </a>
+            )}
+            <div className="nav-acct" title={isAdmin ? 'Administrator — full access' : 'Operator — monitoring and remediation'}>
+              {isAdmin ? <ShieldCheck size={16} aria-hidden="true" /> : <Shield size={16} aria-hidden="true" />}
+              <span className="nav-text">{isAdmin ? 'Admin' : 'Operator'}</span>
+              <button className="nav-signout" onClick={onLogout} title="Sign out" aria-label="Sign out">
+                <LogOut size={16} aria-hidden="true" />
+              </button>
+            </div>
+          </div>
+        </nav>
+
+        <main className="main">
         {tab === 'overview' && (
           <div className="stack">
+            <StatusBand alerts={alerts as Alert[]} blockedIPs={blockedIPs as BlockedIP[]}
+              logs={logs as LogEntry[]} anyError={anyError} connected={connected} />
+            <SeverityLedger alerts={alerts as Alert[]} />
             <div className="card">
               <div className="card-head">
                 <span className="card-title">Anomaly score timeline</span>
@@ -1788,16 +2056,20 @@ function DashboardView({ onLogout, theme, toggleTheme, role }: { onLogout: () =>
             <div className="card">
               <div className="card-head">
                 <span className="card-title">Recent alerts</span>
-                <span className="card-hint">Select a row for the full report</span>
+                <span className="card-hint hide-sm">Latest 5 — select a row for the full report</span>
                 <div className="spacer" />
-                <ExportMenu name="alerts" rows={sortedAlerts} columns={ALERT_COLUMNS} />
-                <button className="btn sm ghost" onClick={resetAlerts} title="Refresh now">
-                  <RefreshCw size={13} />Refresh
+                <button className="btn sm ghost" onClick={() => setTab('alerts')} title="See every alert">
+                  View all →
                 </button>
               </div>
-              <AlertList alerts={alerts as Alert[]} loading={alertsStatus === 'connecting'} onSelect={setSelectedAlert} />
+              <AlertList alerts={sortedAlerts} loading={alertsStatus === 'connecting'} onSelect={setSelectedAlert} limit={5} />
             </div>
           </div>
+        )}
+
+        {tab === 'alerts' && (
+          <AlertsPanel alerts={alerts as Alert[]} loading={alertsStatus === 'connecting'}
+            onSelect={setSelectedAlert} onRefresh={resetAlerts} />
         )}
 
         {tab === 'logs' && (
@@ -1820,16 +2092,21 @@ function DashboardView({ onLogout, theme, toggleTheme, role }: { onLogout: () =>
           <div className="spacer" />
           <span className="mono">MYT (UTC+8)</span>
         </footer>
+        </main>
       </div>
 
       {activeCritical && (
-        <CriticalToast alert={activeCritical} total={criticalAlerts.length}
+        <CriticalToast alert={activeCritical} total={activeCriticals.length}
+          index={criticalIndex} remaining={pendingCriticals.length}
           onView={() => { setSelectedAlert(activeCritical); dismissCritical(activeCritical.alert_id) }}
-          onDismiss={() => dismissCritical(activeCritical.alert_id)} />
+          onDismiss={() => dismissCritical(activeCritical.alert_id)}
+          onDismissAll={() => dismissCritical(...pendingCriticals.map(a => a.alert_id))} />
       )}
 
       {selectedAlert && (
-        <ThreatReport alert={selectedAlert} onClose={() => setSelectedAlert(null)} onUnblock={handleUnblock} />
+        <ThreatReport alert={selectedAlert}
+          block={(blockedIPs as BlockedIP[]).find(b => b.ip === selectedAlert.source_ip) ?? null}
+          onClose={() => setSelectedAlert(null)} onUnblock={handleUnblock} />
       )}
     </>
   )

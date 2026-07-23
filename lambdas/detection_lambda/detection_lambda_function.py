@@ -39,6 +39,30 @@ WAF_IPSET_ID     = os.environ.get("WAF_IPSET_ID", "")                 # set once
 WAF_IPSET_NAME   = os.environ.get("WAF_IPSET_NAME", "acs-blocked-ips")
 WAF_IPSET_SCOPE  = os.environ.get("WAF_IPSET_SCOPE", "REGIONAL")
 
+# Second enforcement point. The agentless path puts CloudFront in front of the
+# customer's app, and a CloudFront web ACL can only reference an IP set with
+# scope CLOUDFRONT, which AWS requires to live in us-east-1. So a blocked
+# address has to be written to BOTH sets: the regional one guarding the API
+# Gateway path, and the global one guarding the edge. Leave the CF variables
+# unset and the edge write is simply skipped.
+WAF_IPSET_ID_CF   = os.environ.get("WAF_IPSET_ID_CF", "")
+WAF_IPSET_NAME_CF = os.environ.get("WAF_IPSET_NAME_CF", "acs-blocked-ips-cf")
+
+# Paths that represent an authentication attempt. At the edge, WAF logs carry
+# no origin status code (responseCodeSent is null for anything WAF did not
+# itself answer), so "failed login" is not observable there. A POST to one of
+# these paths is counted instead — the same substitution rate-based bot rules
+# make. Comma-separated, overridable without a redeploy.
+AUTH_PATHS = tuple(
+    p.strip().lower()
+    for p in os.environ.get("AUTH_PATHS", "/login,/signin,/auth,/api/login,/api/auth").split(",")
+    if p.strip()
+)
+
+print(f"[WAF] enforcement {'ENABLED' if WAF_IPSET_ID else 'DISABLED — WAF_IPSET_ID not set'} "
+      f"(ipset={WAF_IPSET_NAME}, scope={WAF_IPSET_SCOPE}); "
+      f"edge {'ENABLED' if WAF_IPSET_ID_CF else 'DISABLED'} (ipset={WAF_IPSET_NAME_CF}, scope=CLOUDFRONT)")
+
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -71,6 +95,9 @@ _geo_reader = None  # lazy singleton across warm invocations
 
 dynamo = boto3.client("dynamodb", region_name=AWS_REGION)
 wafv2  = boto3.client("wafv2", region_name=AWS_REGION)
+# CLOUDFRONT-scope resources are only addressable through us-east-1, whatever
+# region this function runs in.
+wafv2_cf = boto3.client("wafv2", region_name="us-east-1")
 s3     = boto3.client("s3", region_name=AWS_REGION)
 
 _engine = None  # lazy singleton across warm invocations
@@ -99,31 +126,53 @@ def _get_geo_reader():
         _geo_reader = maxminddb.open_database(GEO_DB_PATH)
         print("[Geo] GeoLite2 database loaded.")
     except Exception as exc:
-        print(f"[Geo] Could not load GeoLite2 DB ({exc}) — geo checks will treat IPs as local.")
+        print(f"[Geo] Could not load GeoLite2 DB ({exc}) — falling back to the hardcoded Malaysian-prefix list. Unknown public IPs will be treated as FOREIGN until the DB loads.")
         _geo_reader = False  # sentinel: tried and failed, don't retry every call
     return _geo_reader
+
+
+# Prototype fallback for when the GeoLite2 database is not shipped with the
+# Lambda (the .mmdb is licensed and heavy). Real geo-IP uses MaxMind above; this
+# curated set of Malaysian ISP prefixes keeps geo detection FUNCTIONAL and
+# deterministic in the prototype/demo without the DB. Default is FOREIGN — an
+# unrecognised public IP counts as a geo-anomaly rather than being waved through
+# as local. Named as a deliberate scope decision; production uses GeoLite2.
+_MY_PREFIXES = (
+    "175.136.", "175.137.", "175.138.", "175.139.", "175.140.", "175.141.",
+    "175.142.", "175.143.", "175.144.", "175.145.",           # TM / Unifi
+    "118.100.", "118.101.", "60.48.", "60.49.", "60.50.", "60.51.", "60.52.",
+    "60.53.", "60.54.", "115.132.", "115.133.", "115.134.", "115.135.",
+    "210.186.", "210.187.", "202.188.", "203.106.", "203.82.",  # other MY ISPs
+)
+
+
+def _is_malaysian_by_prefix(ip: str) -> bool:
+    return any(ip.startswith(p) for p in _MY_PREFIXES)
 
 
 def is_malaysian_ip(ip: str) -> bool:
     """
     True if the IP is Malaysian or a private/internal address.
-    Uses MaxMind GeoLite2 for a real country lookup; falls back to treating
-    the IP as local if the database is unavailable (fail-open, so a missing
-    DB never causes a flood of false geo-anomalies).
+    Uses MaxMind GeoLite2 for a real country lookup when the database is
+    available; otherwise falls back to a hardcoded Malaysian-prefix check so geo
+    detection still works in the prototype (an unknown public IP is treated as
+    FOREIGN, not silently local).
     """
     if _is_private_ip(ip):
         return True
     reader = _get_geo_reader()
     if not reader:
-        return True  # fail-open if DB unavailable
+        return _is_malaysian_by_prefix(ip)  # prototype fallback (default foreign)
     try:
         result = reader.get(ip)
         if not result:
-            return True  # not in DB (reserved/anycast) — treat as local
-        iso = result.get("country", {}).get("iso_code")
+            return _is_malaysian_by_prefix(ip)  # not in DB — use prefix, not fail-open
+        # Schema-tolerant: GeoLite2 and DB-IP nest it under country.iso_code;
+        # some free DBs (e.g. IPLocate) put it at the top level as country_code.
+        iso = (result.get("country", {}) or {}).get("iso_code") or result.get("country_code")
         return iso == HOME_COUNTRY
     except Exception:
-        return True
+        return _is_malaysian_by_prefix(ip)
 
 
 def _decode_kinesis_record(record) -> list:
@@ -146,11 +195,61 @@ def _decode_kinesis_record(record) -> list:
     return events
 
 
+def _normalise_waf_record(rec: dict) -> dict | None:
+    """
+    Convert one AWS WAF log record into the internal event shape.
+
+    WAF logs describe the request as the EDGE saw it, which is a different
+    vantage point from the application's own logs — richer in some ways, blind
+    in others:
+
+      available : client IP, ISO country, URI, method, body size, headers,
+                  JA3/JA4 TLS fingerprint, WAF's own ALLOW/BLOCK action
+      missing   : the origin's HTTP status. `responseCodeSent` is populated
+                  only when WAF itself answered the request, so it is null for
+                  everything that reached the app. A failed login is therefore
+                  invisible here and has to be inferred from the request side.
+
+    Returning None means "not a WAF record" so the caller can fall through to
+    the application-log path.
+    """
+    http = rec.get("httpRequest")
+    if not isinstance(http, dict) or "clientIp" not in http:
+        return None
+
+    headers = {}
+    for h in http.get("headers", []) or []:
+        name = str(h.get("name", "")).lower()
+        if name:
+            headers[name] = h.get("value", "")
+
+    # WAF's own verdict is a real signal: a request it already blocked is
+    # evidence about this IP even though the app never saw it.
+    waf_action = str(rec.get("action", "")).upper()
+
+    return {
+        "_source":      "waf",
+        "ip":           http.get("clientIp", ""),
+        "event_type":   f"EDGE_{http.get('httpMethod', 'REQUEST')}",
+        "uri":          http.get("uri", ""),
+        "method":       http.get("httpMethod", ""),
+        "country":      http.get("country", ""),
+        "payload_size": rec.get("requestBodySize", 0) or 0,
+        "user_agent":   headers.get("user-agent", ""),
+        "ja3":          rec.get("ja3Fingerprint", ""),
+        "waf_blocked":  1 if waf_action == "BLOCK" else 0,
+    }
+
+
 def _decode_cwlogs_direct(event) -> list:
     """
     Direct CloudWatch Logs subscription (no Kinesis in between).
     The whole event is: {"awslogs": {"data": "<base64 gzip>"}}
     Decoded payload has the same DATA_MESSAGE / logEvents structure.
+
+    Two producers now feed this function: the target application's own JSON
+    log lines, and AWS WAF's edge records forwarded from us-east-1. Both are
+    JSON, so they are told apart by shape rather than by source.
     """
     payload = base64.b64decode(event["awslogs"]["data"])
     decompressed = gzip.GzipFile(fileobj=io.BytesIO(payload)).read()
@@ -161,11 +260,13 @@ def _decode_cwlogs_direct(event) -> list:
         for log_event in data.get("logEvents", []):
             msg = log_event.get("message", "")
             try:
-                # Our target app logs structured JSON lines.
-                events.append(json.loads(msg))
+                parsed = json.loads(msg)
             except (json.JSONDecodeError, TypeError):
                 # Not JSON (e.g. a plain access log line) — skip.
                 continue
+            if not isinstance(parsed, dict):
+                continue
+            events.append(_normalise_waf_record(parsed) or parsed)
     return events
 
 
@@ -209,23 +310,66 @@ def _save_window_counters(ip: str, events: list):
         print(f"[WARN] Could not save window state: {exc}")
 
 
+def _is_auth_attempt(event: dict) -> bool:
+    """A POST at one of the configured auth paths. Used as the edge-side stand-in
+    for a failed login, which the edge cannot observe."""
+    if str(event.get("method", "")).upper() != "POST":
+        return False
+    uri = str(event.get("uri", "")).lower()
+    return any(uri.startswith(p) for p in AUTH_PATHS)
+
+
 def extract_features(ip: str, event: dict) -> dict:
     now = time.time()
+    is_edge = event.get("_source") == "waf"
     state  = _get_window_counters(ip)
     events = [e for e in state["events"] if now - e["t"] < WINDOW_SECONDS]
+
+    # Application logs carry a status; edge logs do not. Recording None rather
+    # than defaulting to 200 keeps an unknown from being counted as a success —
+    # otherwise every edge request would dilute failed_status_rate towards zero
+    # and suppress the volume rules.
+    raw_status = event.get("status")
+    if str(raw_status).isdigit():
+        status = int(raw_status)
+    else:
+        status = None if is_edge else 200
+
     events.append({
         "t":      now,
-        "status": int(event.get("status", 200)) if str(event.get("status", "")).isdigit() else 200,
+        "status": status,
         "size":   float(event.get("payload_size", event.get("file_size", 0)) or 0),
+        "auth":   1 if (is_edge and _is_auth_attempt(event)) else 0,
+        "blk":    int(event.get("waf_blocked", 0) or 0),
+        "uri":    str(event.get("uri", ""))[:120],
     })
     _save_window_counters(ip, events)
 
-    total_requests     = len(events)
-    failed              = sum(1 for e in events if e["status"] >= 400)
+    total_requests = len(events)
+    # Two roads to the same signal. From application logs it is a 4xx/5xx
+    # response; from edge logs it is an authentication attempt or a request WAF
+    # itself blocked. Both mean "this source is being refused", which is what
+    # the brute-force rules are really counting, so they share one counter and
+    # the existing thresholds (>=5 MEDIUM, >=15 HIGH) apply unchanged.
+    failed_status = sum(1 for e in events if e.get("status") is not None and e["status"] >= 400)
+    auth_attempts = sum(1 for e in events if e.get("auth"))
+    waf_blocks    = sum(1 for e in events if e.get("blk"))
+    failed        = failed_status + auth_attempts + waf_blocks
+
     failed_status_rate  = failed / total_requests if total_requests else 0.0
     sizes                = [e["size"] for e in events]
     mean_sz               = sum(sizes) / len(sizes) if sizes else 0.0
     payload_size_variance = (sum((s - mean_sz) ** 2 for s in sizes) / len(sizes)) if len(sizes) > 1 else 0.0
+
+    # Scanning fingerprint: many distinct paths from one source in one window.
+    uris = [e.get("uri") for e in events if e.get("uri")]
+    uri_diversity = round(len(set(uris)) / len(uris), 4) if uris else 0.0
+
+    # WAF reports the viewer's country directly, which is both cheaper and more
+    # reliable than a database lookup — and it is the true client IP, not the
+    # proxy's. Fall back to the local lookup for application-sourced events.
+    country = str(event.get("country", "")).upper()
+    geo_anomaly = (0 if country == HOME_COUNTRY else 1) if country else (0 if is_malaysian_ip(ip) else 1)
 
     return {
         "ip":                    ip,
@@ -233,7 +377,10 @@ def extract_features(ip: str, event: dict) -> dict:
         "failed_count":          failed,
         "failed_status_rate":    round(failed_status_rate, 4),
         "payload_size_variance": round(payload_size_variance, 2),
-        "geo_anomaly":           0 if is_malaysian_ip(ip) else 1,
+        "geo_anomaly":           geo_anomaly,
+        "auth_attempts":         auth_attempts,
+        "uri_diversity":         uri_diversity,
+        "source":                "edge" if is_edge else "app",
     }
 
 
@@ -358,8 +505,7 @@ def _block_ip(ip: str, features: dict, result: dict):
         )
         old   = resp.get("Attributes") or {}
         prior = old.get("severity", {}).get("S") if old else None
-        if WAF_IPSET_ID:
-            _add_ip_to_waf_set(ip)
+        _add_ip_to_waf_set(ip)
         return True, prior
 
     except dynamo.exceptions.ConditionalCheckFailedException:
@@ -375,8 +521,7 @@ def _block_ip(ip: str, features: dict, result: dict):
             # failing open cannot storm. Enforce at the WAF and let the caller
             # notify — a repeated message beats a silent miss.
             print(f"[WARN] Transient DynamoDB fault on blocklist write ({code}) — alerting anyway.")
-            if WAF_IPSET_ID:
-                _add_ip_to_waf_set(ip)
+            _add_ip_to_waf_set(ip)
             return True, None
         # Permanent fault (ValidationException, AccessDeniedException,
         # ResourceNotFoundException). These fail identically for EVERY event,
@@ -393,9 +538,9 @@ def _block_ip(ip: str, features: dict, result: dict):
         return False, None
 
 
-def _add_ip_to_waf_set(ip: str, max_retries: int = 5):
+def _add_ip_to_one_set(client, name: str, scope: str, ipset_id: str, ip: str, max_retries: int = 5) -> bool:
     """
-    Add /32 CIDR of the IP to the WAF IP Set.
+    Add the /32 of `ip` to one WAF IP set.
 
     Concurrent invocations (e.g. a burst of attack requests) may each try to
     update the same IP Set at once. WAF uses optimistic locking via a LockToken,
@@ -406,28 +551,51 @@ def _add_ip_to_waf_set(ip: str, max_retries: int = 5):
     import random
     for attempt in range(max_retries):
         try:
-            resp = wafv2.get_ip_set(Name=WAF_IPSET_NAME, Scope=WAF_IPSET_SCOPE, Id=WAF_IPSET_ID)
+            resp = client.get_ip_set(Name=name, Scope=scope, Id=ipset_id)
             addresses = set(resp["IPSet"]["Addresses"])
             cidr = f"{ip}/32"
             if cidr in addresses:
-                return  # already blocked — nothing to do (idempotent)
+                return True  # already blocked — nothing to do (idempotent)
             addresses.add(cidr)
-            wafv2.update_ip_set(
-                Name=WAF_IPSET_NAME,
-                Scope=WAF_IPSET_SCOPE,
-                Id=WAF_IPSET_ID,
-                Addresses=list(addresses),
-                LockToken=resp["LockToken"],
+            client.update_ip_set(
+                Name=name, Scope=scope, Id=ipset_id,
+                Addresses=list(addresses), LockToken=resp["LockToken"],
             )
-            return  # success
-        except wafv2.exceptions.WAFOptimisticLockException:
+            return True
+        except client.exceptions.WAFOptimisticLockException:
             # Another invocation updated the set first; back off and retry.
             time.sleep(0.2 * (attempt + 1) + random.uniform(0, 0.2))
             continue
         except Exception as exc:
-            print(f"[WARN] WAF IP Set update failed: {exc}")
-            return
-    print(f"[WARN] WAF IP Set update gave up after {max_retries} retries for {ip}")
+            print(f"[WARN] WAF IP Set update failed ({scope}/{name}): {exc}")
+            return False
+    print(f"[WARN] WAF IP Set update gave up after {max_retries} retries for {ip} ({scope}/{name})")
+    return False
+
+
+def _add_ip_to_waf_set(ip: str):
+    """
+    Enforce a block at every configured edge.
+
+    The two sets are independent: a failure to reach the CloudFront set must
+    not prevent the regional block from landing, and vice versa. Each is
+    attempted and reported separately so a partial enforcement is visible in
+    CloudWatch rather than silently halving the protection.
+    """
+    targets = []
+    if WAF_IPSET_ID:
+        targets.append((wafv2, WAF_IPSET_NAME, WAF_IPSET_SCOPE, WAF_IPSET_ID))
+    if WAF_IPSET_ID_CF:
+        targets.append((wafv2_cf, WAF_IPSET_NAME_CF, "CLOUDFRONT", WAF_IPSET_ID_CF))
+
+    if not targets:
+        print("[WARN] No WAF IP set configured — WAF enforcement is OFF. "
+              "IP recorded in the DynamoDB blocklist only; it is NOT blocked at the edge.")
+        return
+
+    for client, name, scope, ipset_id in targets:
+        ok = _add_ip_to_one_set(client, name, scope, ipset_id, ip)
+        print(f"[WAF] block {ip} -> {scope}/{name}: {'ok' if ok else 'FAILED'}")
 
 
 def _send_telegram(ip: str, features: dict, result: dict, escalated_from: str = None):

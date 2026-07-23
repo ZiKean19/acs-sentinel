@@ -1,31 +1,44 @@
 #!/usr/bin/env python3
 """
-demo_detection.py — ACS Sentinel deterministic detection demo
+demo_detection.py — ACS Sentinel detection demo (ML-led, deterministic)
 
-Demonstrates the detection engine classifying traffic across ALL severity
-tiers, reliably and repeatably, by invoking the Detection Lambda directly with
-controlled, complete sliding-window inputs.
+Shows the detection engine classifying traffic across every severity tier by
+invoking the Detection Lambda directly with controlled, complete sliding-window
+inputs, then reading back the ACTUAL score + severity the engine assigned.
 
-Why direct invoke (vs. HTTP attacks)?
--------------------------------------
-The production path (attack -> CloudWatch -> Detection Lambda) buffers and
-batches log events over ~60s, so the exact window contents that reach the
-detector are non-deterministic — making a scripted severity ladder unreliable.
-Invoking the detector directly with a precise, complete window gives
-deterministic results: each scenario produces exactly its intended severity,
-cleanly demonstrating both the rule engine and the Isolation Forest ML.
+Design of this demo
+-------------------
+The star is the Isolation Forest (ML), demonstrated on LOCAL Malaysian source
+IPs (geo_anomaly = 0) with traffic kept UNDER the rule-engine thresholds
+(failed_count < 5, total_requests < 60) so that ONLY the ML fires. This proves
+the ML earns its place: it flags increasingly anomalous local traffic that the
+deterministic rules never see.
 
-This exercises the SAME detection code the production path uses. It is the
-detection-logic demonstration; the end-to-end WAF enforcement (real HTTP attack
--> 403 block) is demonstrated separately via attack_simulator.py.
+The rule engine is shown as a SUPPORTING act (bruteforce, flood) — the loud,
+obvious attacks any signature system would catch. A single FOREIGN cameo shows
+the geo_anomaly feature nudging severity up.
+
+Why direct invoke (vs. real HTTP attacks)?
+------------------------------------------
+The production path (attack -> CloudWatch -> Detection Lambda) batches log
+events over ~60s, so the exact window that reaches the detector is
+non-deterministic — unreliable for a scripted severity ladder. Direct invoke
+with a precise, complete window is deterministic. This exercises the SAME
+detection code the production path runs. The end-to-end WAF block (real HTTP ->
+403) is demonstrated separately by attack_simulator.py.
+
+Note on ML tiers
+----------------
+The exact tier a profile lands in depends on the trained model's score
+distribution. This script READS BACK and prints the real score + severity after
+each scenario, so what you present is always the engine's actual output. If a
+tier lands a band off from the label, nudge that scenario's numbers — the
+read-back tells you immediately.
 
 Usage
 -----
-    python demo_detection.py           # runs the full severity ladder
-    python demo_detection.py low       # run a single tier
-
-Each scenario uses a DISTINCT source IP (real, routable, correctly
-geolocated) so alerts appear as separate entries on the dashboard.
+    python demo_detection.py           # full ladder, ML-led
+    python demo_detection.py ml_high   # a single scenario
 """
 
 import sys
@@ -37,55 +50,64 @@ import time
 import subprocess
 
 DETECTION_LAMBDA = "acs-detection-lambda"
+ALERTS_TABLE     = "alerts"
 AWS_REGION       = "ap-southeast-1"
 
-# Each scenario: distinct real IP (correctly geolocates), plus the traffic
-# profile (request count, failure rate) engineered to land in a specific tier.
-# MY = Malaysian (geo_anomaly=0), US = foreign (geo_anomaly=1).
+# name -> (ip, geo, n_req, n_fail, var)
+#   geo   : "MY" local (geo_anomaly=0) or "US" foreign (geo_anomaly=1)
+#   n_req : requests in the 60s window
+#   n_fail: failed (401) requests  — keep < 5 for pure-ML scenarios
+#   var   : "flat" (uniform payloads) or "spread" (high payload-size variance,
+#           an ML-only signal — no rule watches it below 1e10)
+#
+# MAIN ACT — Isolation Forest on LOCAL Malaysian IPs, under every rule threshold.
+# SUPPORTING — rule engine (bruteforce, flood). CAMEO — foreign geo bump.
 SCENARIOS = {
-    # name          ip                 geo   n_req  n_fail  expected
-    "normal":     ("175.136.60.20",   "MY",   8,     0),    # -> NONE  (no alert)
-    "low":        ("175.136.50.10",   "MY",   15,    2),    # -> LOW   (ML)
-    "medium":     ("175.136.55.15",   "MY",   25,    6),    # -> MEDIUM(ML)
-    "stealth":    ("45.33.32.156",    "US",   40,    14),   # -> HIGH  (ML + geo)
-    "bruteforce": ("8.8.8.8",         "US",   55,    55),   # -> HIGH  (rule)
-    "flood":      ("208.67.222.222",  "US",   350,   0),    # -> CRITICAL (rule)
+    "normal":     ("175.136.60.20", "MY",   8,   0, "flat"),    # control -> no alert
+    "ml_low":     ("175.136.50.10", "MY",  15,   2, "flat"),    # ML
+    "ml_medium":  ("175.136.55.15", "MY",  32,   3, "spread"),  # ML
+    "ml_high":    ("175.136.58.22", "MY",  55,   4, "spread"),  # ML (still < rules)
+    "bruteforce": ("175.136.70.30", "MY",  22,  20, "flat"),    # rule (failed_count >= 15)
+    "flood":      ("175.136.80.40", "MY", 320,   0, "flat"),    # rule (requests >= 300)
+    "foreign":    ("45.33.32.156",  "US",  32,   3, "spread"),  # cameo — geo bump
 }
 
 EXPECTED = {
-    "normal":     "NONE (no alert — control)",
-    "low":        "LOW  (Isolation Forest / ML)",
-    "medium":     "MEDIUM (Isolation Forest / ML)",
-    "stealth":    "HIGH (Isolation Forest / ML — under rule thresholds + foreign)",
-    "bruteforce": "HIGH (rule engine — high failure rate)",
-    "flood":      "CRITICAL (rule engine — DDoS volume)",
+    "normal":     "NONE — control, no alert",
+    "ml_low":     "ML (Isolation Forest) — mild local anomaly",
+    "ml_medium":  "ML (Isolation Forest) — moderate local anomaly",
+    "ml_high":    "ML (Isolation Forest) — strong local anomaly, still under rules",
+    "bruteforce": "RULE — brute force (failed_count >= 15)",
+    "flood":      "RULE — DDoS volume (requests >= 300)",
+    "foreign":    "ML + geo — same profile as ml_medium but foreign, bumped up",
 }
 
+ORDER = ["normal", "ml_low", "ml_medium", "ml_high", "bruteforce", "flood", "foreign"]
 
-def _build_event(ip: str, n_req: int, n_fail: int) -> str:
-    """
-    Build a gzipped+base64 CloudWatch Logs event carrying a complete window of
-    n_req requests (n_fail of them failures, placed last so the running failure
-    rate rises gradually) from a single IP.
-    """
+
+def _build_event(ip: str, n_req: int, n_fail: int, var: str) -> str:
+    """Gzip+base64 CloudWatch Logs event = one complete window of n_req requests
+    (n_fail failures, placed last so the failure count rises gradually) from ip.
+    var='spread' injects a few large payloads to raise payload_size_variance —
+    a pure-ML signal that trips no rule."""
     events = []
     for i in range(n_req):
-        is_fail = i >= (n_req - n_fail)  # failures at the end
-        status = 401 if is_fail else 200
+        is_fail = i >= (n_req - n_fail)
+        if var == "spread" and i % 7 == 0:
+            size = 90_000 + (i * 1500)     # occasional big payloads -> high variance
+        else:
+            size = 40 + (i % 20)
         events.append({
             "ip": ip,
             "event_type": "LOGIN_FAIL" if is_fail else "PAGE_VIEW",
-            "status": status,
+            "status": 401 if is_fail else 200,
             "path": "/login" if is_fail else "/",
-            "payload_size": 40 + (i % 20),
+            "payload_size": size,
         })
-
     cwl = {
         "messageType": "DATA_MESSAGE",
-        "logEvents": [
-            {"id": str(i), "timestamp": 0, "message": json.dumps(e)}
-            for i, e in enumerate(events)
-        ],
+        "logEvents": [{"id": str(i), "timestamp": 0, "message": json.dumps(e)}
+                      for i, e in enumerate(events)],
     }
     buf = io.BytesIO()
     with gzip.GzipFile(fileobj=buf, mode="wb") as f:
@@ -93,72 +115,90 @@ def _build_event(ip: str, n_req: int, n_fail: int) -> str:
     return json.dumps({"awslogs": {"data": base64.b64encode(buf.getvalue()).decode()}})
 
 
+def _aws(args, **kw):
+    return subprocess.run(["aws", *args, "--region", AWS_REGION],
+                          capture_output=True, text=True, timeout=60, **kw)
+
+
 def _clear_window(ip: str):
-    """Clear this IP's sliding-window state so the scenario starts clean."""
+    """Reset this IP's sliding-window state so the scenario starts clean."""
     try:
-        subprocess.run(
-            ["aws", "dynamodb", "delete-item",
-             "--table-name", "ip-windows",
-             "--key", json.dumps({"ip": {"S": ip}}),
-             "--region", AWS_REGION],
-            capture_output=True, timeout=30,
-        )
+        _aws(["dynamodb", "delete-item", "--table-name", "ip-windows",
+              "--key", json.dumps({"ip": {"S": ip}})])
     except Exception:
         pass
+
+
+def _read_back(ip: str):
+    """Query the alerts table and print the engine's ACTUAL verdict for this IP —
+    the real score + severity, not a guess. This is the ML demonstration."""
+    time.sleep(2)  # let the write land
+    try:
+        r = _aws(["dynamodb", "scan", "--table-name", ALERTS_TABLE,
+                  "--filter-expression", "source_ip = :ip",
+                  "--expression-attribute-values", json.dumps({":ip": {"S": ip}}),
+                  "--output", "json"])
+        items = json.loads(r.stdout or "{}").get("Items", [])
+        if not items:
+            print("    -> ACTUAL: no alert (classified NONE / below threshold)")
+            return
+        newest = max(items, key=lambda it: it.get("timestamp", {}).get("S", ""))
+        sev    = newest.get("severity", {}).get("S", "?")
+        score  = newest.get("score", {}).get("N", "?")
+        threat = newest.get("type", {}).get("S", "")
+        engine = "rule" if str(score) in ("-0.3", "-0.6", "-0.8", "-1.0") else "isolation_forest"
+        print(f"    -> ACTUAL: {sev:<8} score={score:<10} {threat}  [{engine}]")
+    except Exception as exc:
+        print(f"    -> read-back failed: {exc}")
 
 
 def run_scenario(name: str):
     if name not in SCENARIOS:
         print(f"Unknown scenario: {name}")
         return
-    ip, geo, n_req, n_fail = SCENARIOS[name]
-    fail_pct = int((n_fail / n_req) * 100) if n_req else 0
-
-    print(f"\n[{name}]  IP {ip} ({geo})  |  {n_req} requests, {n_fail} failed ({fail_pct}%)")
+    ip, geo, n_req, n_fail, var = SCENARIOS[name]
+    print(f"\n[{name}]  IP {ip} ({geo})  |  {n_req} req, {n_fail} failed, payload={var}")
     print(f"    expected: {EXPECTED[name]}")
 
-    # Clean window first so accumulation from a prior run can't skew it.
     _clear_window(ip)
-
-    payload = _build_event(ip, n_req, n_fail)
+    payload = _build_event(ip, n_req, n_fail, var)
     with open("/tmp/_demo_payload.json", "w") as f:
         f.write(payload)
 
     try:
-        result = subprocess.run(
-            ["aws", "lambda", "invoke",
-             "--function-name", DETECTION_LAMBDA,
-             "--payload", "file:///tmp/_demo_payload.json",
-             "--cli-binary-format", "raw-in-base64-out",
-             "--region", AWS_REGION,
-             "/tmp/_demo_response.json"],
-            capture_output=True, text=True, timeout=60,
-        )
-        if result.returncode == 0:
-            print(f"    -> sent to detector. Check the dashboard for the alert.")
-        else:
+        result = _aws(["lambda", "invoke", "--function-name", DETECTION_LAMBDA,
+                       "--payload", "file:///tmp/_demo_payload.json",
+                       "--cli-binary-format", "raw-in-base64-out",
+                       "/tmp/_demo_response.json"])
+        if result.returncode != 0:
             print(f"    -> invoke failed: {result.stderr.strip()}")
+            return
     except FileNotFoundError:
         print("    -> ERROR: aws CLI not found. Run this from CloudShell.")
+        return
     except Exception as exc:
         print(f"    -> ERROR: {exc}")
+        return
+
+    _read_back(ip)
 
 
 def main():
-    print("=" * 64)
-    print("ACS Sentinel — Detection Severity Demo (deterministic)")
-    print("=" * 64)
+    print("=" * 68)
+    print("ACS Sentinel — Detection demo (ML-led, local traffic)")
+    print("=" * 68)
+    print("Main act: Isolation Forest on LOCAL Malaysian IPs (rules stay silent).")
+    print("Supporting: rule engine (bruteforce, flood). Cameo: foreign geo bump.\n")
 
     if len(sys.argv) > 1:
         run_scenario(sys.argv[1])
     else:
-        # Full ladder, in ascending severity order.
-        for name in ("normal", "low", "medium", "stealth", "bruteforce", "flood"):
+        for name in ORDER:
             run_scenario(name)
-            time.sleep(3)  # small gap so alerts appear in order on the dashboard
+            time.sleep(3)
 
-    print("\nDone. Alerts should appear on the dashboard within a few seconds.")
-    print("low/medium/stealth = ML (Isolation Forest); bruteforce/flood = rules.")
+    print("\nDone. Each line's ACTUAL row is the engine's real output.")
+    print("ml_* = Isolation Forest; bruteforce/flood = rules; foreign = geo bump.")
 
 
 if __name__ == "__main__":

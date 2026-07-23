@@ -69,11 +69,13 @@ export interface LogPage {
   scanned?: number
 }
 
-export async function fetchLogPage(opts: { cursor?: string | null, q?: string, limit?: number } = {}): Promise<LogPage> {
+export async function fetchLogPage(opts: { cursor?: string | null, q?: string, limit?: number, from?: string, to?: string } = {}): Promise<LogPage> {
   const p = new URLSearchParams()
   if (opts.cursor) p.set('cursor', opts.cursor)
   if (opts.q) p.set('q', opts.q)
   if (opts.limit) p.set('limit', String(opts.limit))
+  if (opts.from) p.set('from', opts.from)
+  if (opts.to) p.set('to', opts.to)
   const qs = p.toString()
   const raw = await get<LogPage | LogEntry[]>(`/logs${qs ? `?${qs}` : ''}`)
   // Tolerate the pre-pagination Lambda, which returned a bare array. The
