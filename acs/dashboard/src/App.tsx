@@ -2008,7 +2008,7 @@ function DashboardView({ onLogout, theme, toggleTheme, role }: { onLogout: () =>
               <div className="nav-label">{g.label}</div>
               {g.items.map(it => (
                 <button key={it.id} className="nav-item" aria-current={tab === it.id ? 'page' : undefined}
-                  onClick={() => setTab(it.id)} title={('hint' in it && it.hint) ? it.hint : it.label}>
+                  onClick={() => setTab(it.id)} title={it.label}>
                   <it.icon size={16} aria-hidden="true" />
                   <span className="nav-text">{it.label}</span>
                   {'badge' in it && !!it.badge && it.badge > 0 && <span className="nav-badge">{it.badge}</span>}
